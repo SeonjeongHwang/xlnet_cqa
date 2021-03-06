@@ -23,6 +23,8 @@ import function_builder
 import prepro_utils
 import model_utils
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 MAX_FLOAT = 1e30
 MIN_FLOAT = -1e30
 
@@ -143,6 +145,7 @@ class InputFeatures(object):
                  input_mask,
                  p_mask,
                  segment_ids,
+                 rationale,
                  cls_index,
                  para_length,
                  start_position=None,
@@ -162,6 +165,7 @@ class InputFeatures(object):
         self.input_mask = input_mask
         self.p_mask = p_mask
         self.segment_ids = segment_ids
+        self.rationale = rationale
         self.cls_index = cls_index
         self.para_length = para_length
         self.start_position = start_position
@@ -884,10 +888,13 @@ class XLNetExampleProcessor(object):
                 segment_ids.append(self.segment_vocab_map["<pad>"])
                 p_mask.append(1)
             
+            rationale = [0] * self.max_seq_length
+            
             assert len(input_ids) == self.max_seq_length
             assert len(input_mask) == self.max_seq_length
             assert len(segment_ids) == self.max_seq_length
             assert len(p_mask) == self.max_seq_length
+            assert len(rationale) == self.max_seq_length
             
             start_position = None
             end_position = None
@@ -920,6 +927,9 @@ class XLNetExampleProcessor(object):
             else:
                 start_position = cls_index
                 end_position = cls_index
+                
+            for idx in range(start_position, end_position+1):
+                rationale[idx] = 1
             
             if logging:
                 tf.logging.info("*** Example ***")
@@ -959,6 +969,7 @@ class XLNetExampleProcessor(object):
                 input_mask=input_mask,
                 p_mask=p_mask,
                 segment_ids=segment_ids,
+                rationale=rationale,
                 cls_index=cls_index,
                 para_length=doc_para_length,
                 start_position=start_position,
@@ -1007,6 +1018,7 @@ class XLNetExampleProcessor(object):
                 features["input_mask"] = create_float_feature(feature.input_mask)
                 features["p_mask"] = create_float_feature(feature.p_mask)
                 features["segment_ids"] = create_int_feature(feature.segment_ids)
+                features["rationale"] = create_int_feature(feature.rationale)
                 features["cls_index"] = create_int_feature([feature.cls_index])
                 
                 features["start_position"] = create_int_feature([feature.start_position])
@@ -1053,6 +1065,7 @@ class XLNetInputBuilder(object):
             "input_mask": tf.FixedLenFeature([seq_length], tf.float32),
             "p_mask": tf.FixedLenFeature([seq_length], tf.float32),
             "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+            "rationale": tf.FixedLenFeature([seq_length], tf.int64),
             "cls_index": tf.FixedLenFeature([], tf.int64),
         }
         
@@ -1112,6 +1125,7 @@ class XLNetInputBuilder(object):
                     'input_mask': tf.placeholder(tf.float32, [None, seq_length], name='input_mask'),
                     'p_mask': tf.placeholder(tf.float32, [None, seq_length], name='p_mask'),
                     'segment_ids': tf.placeholder(tf.int32, [None, seq_length], name='segment_ids'),
+                    'rationale': tf.placeholder(tf.int32, [None, seq_length], name="rationale"),
                     'cls_index': tf.placeholder(tf.int32, [None], name='cls_index'),
                 }
                 
@@ -1160,12 +1174,28 @@ class XLNetModelBuilder(object):
         
         return loss
     
+    def _truncated_BCE_loss(self, data, label, mask): #[b,l]
+        batch = FLAGS.train_batch_size
+        
+        each_seq_len = tf.Session().run(tf.reduce_sum(mask, axis=-1)) #[b]
+        
+        clear_data = data[0,:each_seq_len[0]]
+        clear_label = label[0,:each_seq_len[0]]
+        loss = tf.nn.sigmoid_cross_entropy_with_logits(clear_label, clear_data)
+        for idx in range(1, batch):
+            clear_data = data[0,:each_seq_len[idx]]
+            clear_label = label[0,:each_seq_len[idx]]
+            loss += tf.nn.sigmoid_cross_entropy_with_logits(clear_label, clear_data)
+        loss = loss / batch
+        return loss
+    
     def _create_model(self,
                       is_training,
                       input_ids,
                       input_mask,
                       p_mask,
                       segment_ids,
+                      rationale,
                       cls_index,
                       start_positions=None,
                       end_positions=None,
@@ -1260,6 +1290,18 @@ class XLNetModelBuilder(object):
                     end_top_prob, end_top_index = tf.nn.top_k(end_prob, k=FLAGS.end_n_top)                  # [b,k,l] --> [b,k,k], [b,k,k]
                     predicts["end_prob"] = end_top_prob
                     predicts["end_index"] = end_top_index
+
+            with tf.variable_scope("rationale", reuse=tf.AUTO_REUSE):
+                rat_result = output_result
+                rat_result = tf.layers.dense(rat_result, units=1, activation=tf.nn.relu,
+                        use_bias=False, kernel_initializer=initializer, kernel_regularizer=None, trainable=True, name="rationale_modeling")
+                rat_result = tf.squeeze(rat_result, axis=-1)
+                rat_para = tf.Variable(tf.random_normal([FLAGS.max_seq_length]), name="rat_parameter")
+                rat_result = tf.math.multiply(rat_result, rat_para, name="rat_para_mul")
+                
+                #rat_result_mask = 1-p_mask
+                #rat_result = self._generate_masked_data(rat_result, rat_result_mask)
+ 
             
             with tf.variable_scope("answer", reuse=tf.AUTO_REUSE):
                 answer_cls_index = self._generate_onehot_label(tf.expand_dims(cls_index, axis=-1), seq_len)              # [b] --> [b,1,l]
@@ -1340,6 +1382,13 @@ class XLNetModelBuilder(object):
                     end_loss = self._compute_loss(end_label, end_label_mask, end_result, end_result_mask)                            # [b]
                     loss += tf.reduce_mean(start_loss + end_loss)
                     
+
+                    rat_label = tf.dtypes.cast(rationale, tf.float32)
+                    rat_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=rat_label, logits=rat_result)
+                    #rat_loss = self._truncated_BCE_loss(rat_result, rat_label, 1-p_mask)
+                    loss += tf.reduce_mean(rat_loss)
+
+                    
                     unk_label = is_unk                                                                                               # [b]
                     unk_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
                     unk_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=unk_label * unk_label_mask, logits=unk_result)         # [b]
@@ -1364,6 +1413,7 @@ class XLNetModelBuilder(object):
                     opt_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
                     opt_loss = self._compute_loss(opt_label, opt_label_mask, opt_result, opt_result_mask)                            # [b]
                     loss += tf.reduce_mean(opt_loss)
+                    tf.logging.info("  Batch size = %f", loss)
         
         return loss, predicts
     
@@ -1385,6 +1435,7 @@ class XLNetModelBuilder(object):
             input_mask = features["input_mask"]
             p_mask = features["p_mask"]
             segment_ids = features["segment_ids"]
+            rationale = features["rationale"]
             cls_index = features["cls_index"]
             
             if is_training:
@@ -1404,7 +1455,7 @@ class XLNetModelBuilder(object):
                 number = None
                 option = None
             
-            loss, predicts = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, cls_index,
+            loss, predicts = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
                 start_position, end_position, is_unk, is_yes, is_no, number, option)
             
             scaffold_fn = model_utils.init_from_checkpoint(FLAGS)
