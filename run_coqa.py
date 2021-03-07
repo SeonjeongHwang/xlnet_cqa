@@ -16,6 +16,7 @@ import string
 import tensorflow as tf
 import numpy as np
 import sentencepiece as sp
+from six.moves import xrange
 
 from tool.eval_coqa import CoQAEvaluator
 from xlnet import xlnet
@@ -96,6 +97,19 @@ flags.DEFINE_string("tpu_zone", None, "GCE zone where the Cloud TPU is located i
 flags.DEFINE_string("gcp_project", None, "Project name for the Cloud TPU-enabled project.")
 flags.DEFINE_string("master", None, "TensorFlow master URL")
 flags.DEFINE_integer("iterations", 1000, "number of iterations per TPU training loop.")
+
+flags.DEFINE_float("beta1", 5.0, "Weights of rationale loss")
+flags.DEFINE_float("beta2", 1.0, "Weights of adversarial training loss")
+flags.DEFINE_float("beta3", 1.0, "Weights of virtual adversarial training loss")
+
+##https://arxiv.org/pdf/1909.10772.pdf
+flags.DEFINE_bool("use_rationale", False, "Rationale tagging task")
+
+##https://github.com/tensorflow/models/blob/2986bcafb9eaa8fed4d78f17a04c4c5afc8f6691/research/adversarial_text/adversarial_losses.py
+flags.DEFINE_bool("adv_training", False, "Adversarial training (AT+VAT)")
+flags.DEFINE_float("perturb_norm_length", 5.0, "Norm length of adversarial perturbation to be optimized with validation.")
+flags.DEFINE_integer("num_power_iteration", 1, "The number of power iteration")
+flags.DEFINE_float("small_constant_for_finite_diff", 1e-1, "Small constant for finite difference method")
 
 class InputExample(object):
     """A single CoQA example."""
@@ -1174,21 +1188,34 @@ class XLNetModelBuilder(object):
         
         return loss
     
-    def _truncated_BCE_loss(self, data, label, mask): #[b,l]
-        batch = FLAGS.train_batch_size
-        
-        each_seq_len = tf.Session().run(tf.reduce_sum(mask, axis=-1)) #[b]
-        
-        clear_data = data[0,:each_seq_len[0]]
-        clear_label = label[0,:each_seq_len[0]]
-        loss = tf.nn.sigmoid_cross_entropy_with_logits(clear_label, clear_data)
-        for idx in range(1, batch):
-            clear_data = data[0,:each_seq_len[idx]]
-            clear_label = label[0,:each_seq_len[idx]]
-            loss += tf.nn.sigmoid_cross_entropy_with_logits(clear_label, clear_data)
-        loss = loss / batch
-        return loss
+    def _scale_12(self, x, norm_length):
+        # shape(x) = (batch, num_timesteps, d)
+        # Divide x by max(abs(x)) for a numerically stable L2 norm.
+        # 2norm(x) = a * 2norm(x/a)
+        # Scale over the full sequence, dims (1, 2)
+        alpha = tf.reduce_max(tf.abs(x), (1, 2), keep_dims=True) + 1e-12
+        l2_norm = alpha * tf.sqrt(
+          tf.reduce_sum(tf.pow(x / alpha, 2), (1, 2), keep_dims=True) + 1e-6)
+        x_unit = x / l2_norm
+        return norm_length * x_unit        
     
+    def _adversarial_embedding_input(self, embedded, loss):
+        grad, = tf.gradients(
+            loss,
+            embedded,
+            aggregation_method=tf.AggregationMethod.EXPERIMENTAL_ACCUMULATE_N)
+        grad = tf.stop_gradient(grad)
+        perturb = self._scale_12(grad, FLAGS.perturb_norm_length)
+        return embedded + perturb
+    
+    def _kl_divergence_with_logits(self, logits, adv_logits):
+        q = tf.nn.softmax(logits)
+        kl = tf.reduce_sum(
+            q * (tf.nn.log_softmax(logits) - tf.nn.log_softmax(adv_logits)), -1) #[b,l,h] -> [b,l]
+        loss = tf.reduce_mean(kl)
+        return loss
+        
+        
     def _create_model(self,
                       is_training,
                       input_ids,
@@ -1203,14 +1230,37 @@ class XLNetModelBuilder(object):
                       is_yes=None,
                       is_no=None,
                       number=None,
-                      option=None):
+                      option=None,
+                      AT=False,
+                      VAT=False,
+                      embedding_input=None):
         """Creates XLNet-CoQA model"""
-        model = xlnet.XLNetModel(
-            xlnet_config=self.model_config,
-            run_config=xlnet.create_run_config(is_training, True, FLAGS),
-            input_ids=tf.transpose(input_ids, perm=[1,0]),                                                               # [b,l] --> [l,b]
-            input_mask=tf.transpose(input_mask, perm=[1,0]),                                                             # [b,l] --> [l,b]
-            seg_ids=tf.transpose(segment_ids, perm=[1,0]))                                                               # [b,l] --> [l,b]
+        if AT:
+            model = xlnet.XLNetModel(
+                xlnet_config=self.model_config,
+                run_config=xlnet.create_run_config(is_training, True, FLAGS),
+                input_ids=tf.transpose(input_ids, perm=[1,0]),                                                               # [b,l] --> [l,b]
+                input_mask=tf.transpose(input_mask, perm=[1,0]),                                                             # [b,l] --> [l,b]
+                seg_ids=tf.transpose(segment_ids, perm=[1,0]),
+                adv_embedd=embedding_input)
+        if VAT:
+            model = xlnet.XLNetModel(
+                xlnet_config=self.model_config,
+                run_config=xlnet.create_run_config(is_training, True, FLAGS),
+                input_ids=tf.transpose(input_ids, perm=[1,0]),                                                               # [b,l] --> [l,b]
+                input_mask=tf.transpose(input_mask, perm=[1,0]),                                                             # [b,l] --> [l,b]
+                seg_ids=tf.transpose(segment_ids, perm=[1,0]),
+                adv_embedd=embedding_input)
+            logits = tf.transpose(model.get_sequence_output(), perm=[1,0,2])
+            return logits
+        
+        else:
+            model = xlnet.XLNetModel(
+                xlnet_config=self.model_config,
+                run_config=xlnet.create_run_config(is_training, True, FLAGS),
+                input_ids=tf.transpose(input_ids, perm=[1,0]),                                                               # [b,l] --> [l,b]
+                input_mask=tf.transpose(input_mask, perm=[1,0]),                                                             # [b,l] --> [l,b]
+                seg_ids=tf.transpose(segment_ids, perm=[1,0]))                                                               # [b,l] --> [l,b]
         
         initializer = model.get_initializer()
         seq_len = tf.shape(input_ids)[-1]
@@ -1292,15 +1342,27 @@ class XLNetModelBuilder(object):
                     predicts["end_index"] = end_top_index
 
             with tf.variable_scope("rationale", reuse=tf.AUTO_REUSE):
-                rat_result = output_result
-                rat_result = tf.layers.dense(rat_result, units=1, activation=tf.nn.relu,
-                        use_bias=False, kernel_initializer=initializer, kernel_regularizer=None, trainable=True, name="rationale_modeling")
-                rat_result = tf.squeeze(rat_result, axis=-1)
-                rat_para = tf.Variable(tf.random_normal([FLAGS.max_seq_length]), name="rat_parameter")
-                rat_result = tf.math.multiply(rat_result, rat_para, name="rat_para_mul")
-                
-                #rat_result_mask = 1-p_mask
-                #rat_result = self._generate_masked_data(rat_result, rat_result_mask)
+                if FLAGS.use_rationale:
+                    rat_result = output_result
+                    rat_result = tf.layers.dense(rat_result, units=1, activation=tf.nn.relu,
+                            use_bias=False, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
+                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="rationale_modeling")
+                    
+                    rat_probs = tf.sigmoid(rat_result)                                                                    # [b,l,1]
+                    rat_hidden = tf.math.multiply(rat_probs, output_result)                                               # [b,l,1], [b,l,h] --> [b,l,h]
+                    rat_hidden = tf.layers.dense(rat_hidden, units=self.model_config.d_model, activation=tf.nn.relu,
+                        use_bias=False, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
+                        kernel_regularizer=None, bias_regularizer=None, trainable=True, name="rationale_modeling_for_ynu") # [b,l,h] --> [b,l,h]
+                    rat_atten = tf.nn.softmax(rat_hidden, axis=-1)                                                        # [b,l,h]
+                    rat_hidden_for_ans = tf.math.multiply(rat_atten, output_result)                                       # [b,l,h]
+                    rat_hidden_for_ans = tf.math.reduce_sum(rat_hidden_for_ans, axis=1)                                  # [b,l,h] --> [b,h]                                
+                    rat_result = tf.squeeze(rat_result, axis=-1)     # [b,l,1] --> [b,l]
+                    
+                    #rat_para = tf.Variable(tf.random_normal([FLAGS.max_seq_length]), name="rat_parameter")
+                    #rat_result = tf.math.multiply(rat_result, rat_para, name="rat_para_mul")
+
+                    #rat_result_mask = 1-p_mask
+                    #rat_result = self._generate_masked_data(rat_result, rat_result_mask)
  
             
             with tf.variable_scope("answer", reuse=tf.AUTO_REUSE):
@@ -1311,9 +1373,12 @@ class XLNetModelBuilder(object):
                 answer_result = tf.concat([answer_feat_result, answer_output_result], axis=-1)             # [b,1,h], [b,1,h] --> [b,1,2h]
                 answer_result = tf.squeeze(answer_result, axis=1)                                                    # [b,1,2h] --> [b,2h]
                 
+                if FLAGS.use_rationale:
+                    answer_result = tf.concat([rat_hidden_for_ans, answer_result], axis=-1)
+
                 answer_result = tf.layers.dense(answer_result, units=self.model_config.d_model, activation=tf.tanh,
                     use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
-                    kernel_regularizer=None, bias_regularizer=None, trainable=True, name="answer_modeling")             # [b,2h] --> [b,h]
+                    kernel_regularizer=None, bias_regularizer=None, trainable=True, name="answer_modeling")             # [b,3h] --> [b,h]
                 
                 answer_result = tf.layers.dropout(answer_result,
                     rate=FLAGS.dropout, seed=np.random.randint(10000), training=is_training)                             # [b,h] --> [b,h]
@@ -1382,13 +1447,11 @@ class XLNetModelBuilder(object):
                     end_loss = self._compute_loss(end_label, end_label_mask, end_result, end_result_mask)                            # [b]
                     loss += tf.reduce_mean(start_loss + end_loss)
                     
+                    if FLAGS.use_rationale:
+                        rat_label = tf.dtypes.cast(rationale, tf.float32)
+                        rat_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=rat_label, logits=rat_result)
+                        loss += FLAGS.beta1 * tf.reduce_mean(rat_loss)
 
-                    rat_label = tf.dtypes.cast(rationale, tf.float32)
-                    rat_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=rat_label, logits=rat_result)
-                    #rat_loss = self._truncated_BCE_loss(rat_result, rat_label, 1-p_mask)
-                    loss += tf.reduce_mean(rat_loss)
-
-                    
                     unk_label = is_unk                                                                                               # [b]
                     unk_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
                     unk_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=unk_label * unk_label_mask, logits=unk_result)         # [b]
@@ -1415,7 +1478,7 @@ class XLNetModelBuilder(object):
                     loss += tf.reduce_mean(opt_loss)
                     tf.logging.info("  Batch size = %f", loss)
         
-        return loss, predicts
+        return loss, predicts, model, output_result ### AT를 밖에서 하기 위해 model도 반환
     
     def get_model_fn(self):
         """Returns `model_fn` closure for TPUEstimator."""
@@ -1455,9 +1518,36 @@ class XLNetModelBuilder(object):
                 number = None
                 option = None
             
-            loss, predicts = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+            loss, predicts, model, logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
                 start_position, end_position, is_unk, is_yes, is_no, number, option)
-            
+                                 
+            if is_training and FLAGS.adv_training:
+                embed_out = model.get_embedding_output()
+                
+                ## Adversarial training
+                adv_embedding_input = self._adversarial_embedding_input(embed_out, loss)
+                adv_loss, _, _, _ = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+                    start_position, end_position, is_unk, is_yes, is_no, number, option, AT=True, embedding_input=adv_embedding_input)
+                loss += FLAGS.beta2 * adv_loss
+                
+                ## Virtual adversarial training
+                d = tf.random_normal(shape=tf.shape(embed_out))
+                for _ in xrange(FLAGS.num_power_iteration):
+                    d = self._scale_12(d, FLAGS.small_constant_for_finite_diff)
+                    perturbed_input = embed_out + d
+                    d_logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+                        start_position, end_position, is_unk, is_yes, is_no, number, option, VAT=True, embedding_input=perturbed_input)
+                    kl = self._kl_divergence_with_logits(logits, d_logits)
+                    d, = tf.gradients(kl, d, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_ACCUMULATE_N)
+                    d = tf.stop_gradient(d)
+                    
+                perturb = self._scale_12(d, FLAGS.perturb_norm_length)
+                perturbed_input = embed_out + perturb
+                vadv_logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+                    start_position, end_position, is_unk, is_yes, is_no, number, option, VAT=True, embedding_input=perturbed_input)
+                vadv_loss = self._kl_divergence_with_logits(logits, vadv_logits)
+                loss += FLAGS.beta3 * vadv_loss
+                
             scaffold_fn = model_utils.init_from_checkpoint(FLAGS)
             
             output_spec = None
@@ -1747,6 +1837,7 @@ def main(_):
         
         train_record_file = os.path.join(FLAGS.output_dir, "train-{0}.tfrecord".format(task_name))
         if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+            FLAGS.use_rationale = True
             train_features = example_processor.convert_examples_to_features(train_examples)
             np.random.shuffle(train_features)
             example_processor.save_features_as_tfrecord(train_features, train_record_file)
@@ -1764,6 +1855,7 @@ def main(_):
         predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}.tfrecord".format(task_name))
         predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}.pkl".format(task_name))
         if not os.path.exists(predict_record_file) or not os.path.exists(predict_pickle_file) or FLAGS.overwrite_data:
+            FLAGS.use_rationale = True
             predict_features = example_processor.convert_examples_to_features(predict_examples)
             example_processor.save_features_as_tfrecord(predict_features, predict_record_file)
             example_processor.save_features_as_pickle(predict_features, predict_pickle_file)
