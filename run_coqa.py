@@ -24,7 +24,7 @@ import function_builder
 import prepro_utils
 import model_utils
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 MAX_FLOAT = 1e30
 MIN_FLOAT = -1e30
@@ -42,7 +42,6 @@ flags.DEFINE_string("model_config_path", default=None, help="Config file of the 
 flags.DEFINE_string("init_checkpoint", default=None, help="Initial checkpoint of the pre-trained model.")
 flags.DEFINE_string("spiece_model_file", default=None, help="Sentence Piece model path.")
 flags.DEFINE_bool("overwrite_data", default=False, help="If False, will use cached data if available.")
-flags.DEFINE_integer("random_seed", default=100, help="Random seed for weight initialzation.")
 flags.DEFINE_string("predict_tag", None, "Predict tag for predict result tracking.")
 
 flags.DEFINE_bool("do_train", default=False, help="Whether to run training.")
@@ -101,6 +100,7 @@ flags.DEFINE_integer("iterations", 1000, "number of iterations per TPU training 
 flags.DEFINE_float("beta1", 5.0, "Weights of rationale loss")
 flags.DEFINE_float("beta2", 1.0, "Weights of adversarial training loss")
 flags.DEFINE_float("beta3", 1.0, "Weights of virtual adversarial training loss")
+flags.DEFINE_float("beta4", 1.0, "Weights of knowledge distillation loss")
 
 ##https://arxiv.org/pdf/1909.10772.pdf
 flags.DEFINE_bool("use_rationale", False, "Rationale tagging task")
@@ -110,6 +110,13 @@ flags.DEFINE_bool("adv_training", False, "Adversarial training (AT+VAT)")
 flags.DEFINE_float("perturb_norm_length", 5.0, "Norm length of adversarial perturbation to be optimized with validation.")
 flags.DEFINE_integer("num_power_iteration", 1, "The number of power iteration")
 flags.DEFINE_float("small_constant_for_finite_diff", 1e-1, "Small constant for finite difference method")
+
+##https://github.com/google-research/google-research/tree/master/bam
+flags.DEFINE_integer("random_seed", default=100, help="Random seed for weight initialzation.")
+flags.DEFINE_bool("teacher", False, "Teacher model for Knowledge distillation")
+flags.DEFINE_bool("student", False, "Student model for Knowledge distillation")
+flags.DEFINE_string("teacher_seed_list", default="", help="The list of teacher's logits for knowledge distillation")
+
 
 class InputExample(object):
     """A single CoQA example."""
@@ -213,7 +220,27 @@ class OutputResult(object):
         self.start_index = start_index
         self.end_prob = end_prob
         self.end_index = end_index
-
+        
+class OutputLogits(object):
+    """A single CoQA result."""
+    def __init__(self,
+                 unique_id,
+                 unk_logits,
+                 yes_logits,
+                 no_logits,
+                 num_logits,
+                 opt_logits,
+                 start_logits,
+                 end_logits):
+        self.unique_id = unique_id
+        self.unk_logits = unk_logits
+        self.yes_logits = yes_logits
+        self.no_logits = no_logits
+        self.num_logits = num_logits
+        self.opt_logits = opt_logits
+        self.start_logits = start_logits
+        self.end_logits = end_logits
+        
 class CoqaPipeline(object):
     """Pipeline for CoQA dataset."""
     def __init__(self,
@@ -1045,6 +1072,31 @@ class XLNetExampleProcessor(object):
                 
                 tf_example = tf.train.Example(features=tf.train.Features(feature=features))
                 writer.write(tf_example.SerializeToString())
+                
+    def save_logits_as_tfrecord(self,
+                              results,
+                              output_file):
+        """Save a set of `OutputLogits`s to a TFRecord file."""
+        def create_int_feature(values):
+            return tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
+        
+        def create_float_feature(values):
+            return tf.train.Feature(float_list=tf.train.FloatList(value=list(values)))
+        
+        with tf.python_io.TFRecordWriter(output_file) as writer:
+            for result in results:
+                logits = collections.OrderedDict()
+                logits["unique_id"] = create_int_feature([result.unique_id])
+                logits["unk_logits"] = create_float_feature(result.unk_logits)
+                logits["yes_logits"] = create_float_feature(result.yes_logits)
+                logits["no_logits"] = create_float_feature(result.no_logits)
+                logits["num_logits"] = create_float_feature(result.num_logits)
+                logits["opt_logits"] = create_float_feature(result.opt_logits)
+                logits["start_logits"] = create_float_feature(result.start_logits)
+                logits["end_logits"] = create_float_feature(result.end_logits)
+                
+                tf_example = tf.train.Example(features=tf.train.Features(feature=logits))
+                writer.write(tf_example.SerializeToString())
     
     def save_features_as_pickle(self,
                                 features,
@@ -1091,6 +1143,15 @@ class XLNetInputBuilder(object):
             name_to_features["is_no"] = tf.FixedLenFeature([], tf.float32)
             name_to_features["number"] = tf.FixedLenFeature([], tf.float32)
             name_to_features["option"] = tf.FixedLenFeature([], tf.float32)
+            
+        if is_training and FLAGS.student:
+            name_to_features["start_position"] = tf.FixedLenFeature([], tf.int64)
+            name_to_features["end_position"] = tf.FixedLenFeature([], tf.int64)
+            name_to_features["is_unk"] = tf.FixedLenFeature([], tf.float32)
+            name_to_features["is_yes"] = tf.FixedLenFeature([], tf.float32)
+            name_to_features["is_no"] = tf.FixedLenFeature([], tf.float32)
+            name_to_features["number"] = tf.FixedLenFeature([], tf.float32)
+            name_to_features["option"] = tf.FixedLenFeature([], tf.float32)            
         
         def _decode_record(record,
                            name_to_features):
@@ -1279,11 +1340,11 @@ class XLNetModelBuilder(object):
                 start_result = tf.squeeze(start_result, axis=-1)                                                       # [b,l,1] --> [b,l]
                 start_result = self._generate_masked_data(start_result, start_result_mask)                        # [b,l], [b,l] --> [b,l]
                 start_prob = tf.nn.softmax(start_result, axis=-1)                                                                  # [b,l]
-                
+                                
                 if not is_training:
                     start_top_prob, start_top_index = tf.nn.top_k(start_prob, k=FLAGS.start_n_top)                # [b,l] --> [b,k], [b,k]
                     predicts["start_prob"] = start_top_prob
-                    predicts["start_index"] = start_top_index
+                    predicts["start_index"] = start_top_index                    
             
             with tf.variable_scope("end", reuse=tf.AUTO_REUSE):
                 if is_training:
@@ -1309,6 +1370,7 @@ class XLNetModelBuilder(object):
                     end_result = tf.squeeze(end_result, axis=-1)                                                       # [b,l,1] --> [b,l]
                     end_result = self._generate_masked_data(end_result, end_result_mask)                          # [b,l], [b,l] --> [b,l]
                     end_prob = tf.nn.softmax(end_result, axis=-1)                                                                  # [b,l]
+                    
                 else:
                     # During inference, compute the end logits based on beam search
                     start_index = self._generate_onehot_label(start_top_index, seq_len)                                # [b,k] --> [b,k,l]
@@ -1340,7 +1402,7 @@ class XLNetModelBuilder(object):
                     end_top_prob, end_top_index = tf.nn.top_k(end_prob, k=FLAGS.end_n_top)                  # [b,k,l] --> [b,k,k], [b,k,k]
                     predicts["end_prob"] = end_top_prob
                     predicts["end_index"] = end_top_index
-
+                    
             with tf.variable_scope("rationale", reuse=tf.AUTO_REUSE):
                 if FLAGS.use_rationale:
                     rat_result = output_result
@@ -1357,6 +1419,7 @@ class XLNetModelBuilder(object):
                     rat_hidden_for_ans = tf.math.multiply(rat_atten, output_result)                                       # [b,l,h]
                     rat_hidden_for_ans = tf.math.reduce_sum(rat_hidden_for_ans, axis=1)                                  # [b,l,h] --> [b,h]                                
                     rat_result = tf.squeeze(rat_result, axis=-1)     # [b,l,1] --> [b,l]
+                    #logits["rat_logits"] = rat_result
                     
                     #rat_para = tf.Variable(tf.random_normal([FLAGS.max_seq_length]), name="rat_parameter")
                     #rat_result = tf.math.multiply(rat_result, rat_para, name="rat_para_mul")
@@ -1393,7 +1456,7 @@ class XLNetModelBuilder(object):
                     unk_result = self._generate_masked_data(unk_result, unk_result_mask)                                # [b], [b] --> [b]
                     unk_prob = tf.sigmoid(unk_result)                                                                                # [b]
                     predicts["unk_prob"] = unk_prob
-                
+                    
                 with tf.variable_scope("yes", reuse=tf.AUTO_REUSE):
                     yes_result = tf.layers.dense(answer_result, units=1, activation=None,
                         use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
@@ -1404,7 +1467,7 @@ class XLNetModelBuilder(object):
                     yes_result = self._generate_masked_data(yes_result, yes_result_mask)                                # [b], [b] --> [b]
                     yes_prob = tf.sigmoid(yes_result)                                                                                # [b]
                     predicts["yes_prob"] = yes_prob
-                
+                    
                 with tf.variable_scope("no", reuse=tf.AUTO_REUSE):
                     no_result = tf.layers.dense(answer_result, units=1, activation=None,
                         use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
@@ -1415,7 +1478,7 @@ class XLNetModelBuilder(object):
                     no_result = self._generate_masked_data(no_result, no_result_mask)                                   # [b], [b] --> [b]
                     no_prob = tf.sigmoid(no_result)                                                                                  # [b]
                     predicts["no_prob"] = no_prob
-                
+                    
                 with tf.variable_scope("num", reuse=tf.AUTO_REUSE):
                     num_result = tf.layers.dense(answer_result, units=12, activation=None,
                         use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
@@ -1425,7 +1488,7 @@ class XLNetModelBuilder(object):
                     num_result = self._generate_masked_data(num_result, num_result_mask)                        # [b,12], [b,1] --> [b,12]
                     num_probs = tf.nn.softmax(num_result, axis=-1)                                                                # [b,12]
                     predicts["num_probs"] = num_probs
-                
+                    
                 with tf.variable_scope("opt", reuse=tf.AUTO_REUSE):
                     opt_result = tf.layers.dense(answer_result, units=3, activation=None,
                         use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
@@ -1435,7 +1498,7 @@ class XLNetModelBuilder(object):
                     opt_result = self._generate_masked_data(opt_result, opt_result_mask)                          # [b,3], [b,1] --> [b,3]
                     opt_probs = tf.nn.softmax(opt_result, axis=-1)                                                                 # [b,3]
                     predicts["opt_probs"] = opt_probs
-            
+                  
             with tf.variable_scope("loss", reuse=tf.AUTO_REUSE):
                 loss = tf.constant(0.0, dtype=tf.float32)
                 if is_training:
@@ -1477,8 +1540,19 @@ class XLNetModelBuilder(object):
                     opt_loss = self._compute_loss(opt_label, opt_label_mask, opt_result, opt_result_mask)                            # [b]
                     loss += tf.reduce_mean(opt_loss)
                     tf.logging.info("  Batch size = %f", loss)
-        
-        return loss, predicts, model, output_result ### AT를 밖에서 하기 위해 model도 반환
+            
+            logits = {}
+            if FLAGS.teacher:
+                logits["start_logits"] = start_result
+                top_end_result, _ = tf.nn.top_k(end_result, k=1)
+                logits["end_logits"] = tf.squeeze(top_end_result)
+                logits["unk_logits"] = unk_result
+                logits["yes_logits"] = yes_result
+                logits["no_logits"] = no_result
+                logits["num_logits"] = num_result
+                logits["opt_logits"] = opt_result
+                
+        return loss, predicts, logits, model, output_result ### AT를 밖에서 하기 위해 model도 반환
     
     def get_model_fn(self):
         """Returns `model_fn` closure for TPUEstimator."""
@@ -1518,7 +1592,7 @@ class XLNetModelBuilder(object):
                 number = None
                 option = None
             
-            loss, predicts, model, logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+            loss, predicts, total_logits, model, logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
                 start_position, end_position, is_unk, is_yes, is_no, number, option)
                                  
             if is_training and FLAGS.adv_training:
@@ -1559,20 +1633,34 @@ class XLNetModelBuilder(object):
                     train_op=train_op,
                     scaffold_fn=scaffold_fn)
             else:
+                predictions={
+                    "unique_id": unique_id,
+                    "unk_prob": predicts["unk_prob"],
+                    "yes_prob": predicts["yes_prob"],
+                    "no_prob": predicts["no_prob"],
+                    "num_probs": predicts["num_probs"],
+                    "opt_probs": predicts["opt_probs"],
+                    "start_prob": predicts["start_prob"],
+                    "start_index": predicts["start_index"],
+                    "end_prob": predicts["end_prob"],
+                    "end_index": predicts["end_index"]
+                    }
+                
+                if FLAGS.teacher:
+                    logits = {
+                        "unk_logits": total_logits["unk_logits"],
+                        "yes_logits": total_logits["yes_logits"],
+                        "no_logits": total_logits["no_logits"],
+                        "num_logits": total_logits["num_logits"],
+                        "opt_logits": total_logits["opt_logits"],
+                        "start_logits": total_logits["start_logits"],
+                        "end_logits": total_logits["end_logits"]
+                    }
+                    predictions.update(logits)
+                    
                 output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                     mode=mode,
-                    predictions={
-                        "unique_id": unique_id,
-                        "unk_prob": predicts["unk_prob"],
-                        "yes_prob": predicts["yes_prob"],
-                        "no_prob": predicts["no_prob"],
-                        "num_probs": predicts["num_probs"],
-                        "opt_probs": predicts["opt_probs"],
-                        "start_prob": predicts["start_prob"],
-                        "start_index": predicts["start_index"],
-                        "end_prob": predicts["end_prob"],
-                        "end_index": predicts["end_index"]
-                    },
+                    predictions=predictions,
                     scaffold_fn=scaffold_fn)
             
             return output_spec
@@ -1784,6 +1872,13 @@ class XLNetPredictProcessor(object):
         self._write_to_json(predict_summary_list, self.output_summary)
         self._write_to_json(predict_detail_list, self.output_detail)
 
+def write_logits(output_dir, tag, seed, logits):
+    tf.logging.info("***** Write teacher's logits *****")
+    f_name = os.path.join(output_dir, "teacher_logits.{0}_{1}.json".format(tag, seed))
+    tf.logging.info("***** {} *****".format(f_name))
+    with open(f_name, "w") as file:
+        json.dump(logits, file, indent=4)
+        
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
     
@@ -1844,7 +1939,24 @@ def main(_):
         
         train_input_fn = XLNetInputBuilder.get_input_fn(train_record_file, FLAGS.max_seq_length, True, True, FLAGS.shuffle_buffer)
         estimator.train(input_fn=train_input_fn, max_steps=FLAGS.train_steps)
-    
+        
+        if FLAGS.teacher:
+            results = estimator.predict(input_fn=train_input_fn)
+            
+            teacher_logits = [OutputLogits(
+                unique_id=result["unique_id"],
+                unk_logits=result["unk_logits"].tolist(),
+                yes_logits=result["yes_logits"].tolist(),
+                no_logits=result["no_logits"].tolist(),
+                num_logits=result["num_logits"].tolist(),
+                opt_logits=result["opt_logits"].tolist(),
+                start_logits=result["start_logits"].tolist(),
+                end_logits=result["end_logits"].tolist()
+            ) for result in results]
+            
+            teacher_logits_record_file = os.path.join(FLAGS.output_dir, "teacher_logits.{0}_{1}.tfrecord".format(FLAGS.predict_tag, FLAGS.random_seed))
+            example_processor.save_logits_as_tfrecord(teacher_logits, teacher_logits_record_file)
+            
     if FLAGS.do_predict:
         predict_examples = data_pipeline.get_dev_examples()
         
