@@ -1144,14 +1144,14 @@ class XLNetInputBuilder(object):
             name_to_features["number"] = tf.FixedLenFeature([], tf.float32)
             name_to_features["option"] = tf.FixedLenFeature([], tf.float32)
             
-        if is_training and FLAGS.student:
-            name_to_features["start_position"] = tf.FixedLenFeature([], tf.int64)
-            name_to_features["end_position"] = tf.FixedLenFeature([], tf.int64)
-            name_to_features["is_unk"] = tf.FixedLenFeature([], tf.float32)
-            name_to_features["is_yes"] = tf.FixedLenFeature([], tf.float32)
-            name_to_features["is_no"] = tf.FixedLenFeature([], tf.float32)
-            name_to_features["number"] = tf.FixedLenFeature([], tf.float32)
-            name_to_features["option"] = tf.FixedLenFeature([], tf.float32)            
+            if FLAGS.student:
+                name_to_features["start_position"] = tf.FixedLenFeature([], tf.int64)
+                name_to_features["end_position"] = tf.FixedLenFeature([], tf.int64)
+                name_to_features["is_unk"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["is_yes"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["is_no"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["number"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["option"] = tf.FixedLenFeature([], tf.float32)            
         
         def _decode_record(record,
                            name_to_features):
@@ -1292,6 +1292,13 @@ class XLNetModelBuilder(object):
                       is_no=None,
                       number=None,
                       option=None,
+                      teacher_start_label=None, 
+                      teacher_end_label=None, 
+                      teacher_unk_label=None, 
+                      teacher_yes_label=None, 
+                      teacher_no_label=None, 
+                      teacher_num_label=None, 
+                      teacher_opt_label=None,
                       AT=False,
                       VAT=False,
                       embedding_input=None):
@@ -1498,7 +1505,21 @@ class XLNetModelBuilder(object):
                     opt_result = self._generate_masked_data(opt_result, opt_result_mask)                          # [b,3], [b,1] --> [b,3]
                     opt_probs = tf.nn.softmax(opt_result, axis=-1)                                                                 # [b,3]
                     predicts["opt_probs"] = opt_probs
-                  
+            
+            logits = {}
+            if FLAGS.teacher or FLAGS.student:
+                logits["start_logits"] = start_prob
+                logits["unk_logits"] = tf.nn.softmax(unk_result, axis=-1)
+                logits["yes_logits"] = tf.nn.softmax(yes_result, axis=-1)
+                logits["no_logits"] = tf.nn.softmax(no_result, axis=-1)
+                logits["num_logits"] = num_probs
+                logits["opt_logits"] = opt_probs
+                if is_training:
+                    logits["end_logits"] = end_prob
+                else:
+                    top_end_result, _ = tf.nn.top_k(end_prob, k=1)
+                    logits["end_logits"] = tf.squeeze(top_end_result)
+            
             with tf.variable_scope("loss", reuse=tf.AUTO_REUSE):
                 loss = tf.constant(0.0, dtype=tf.float32)
                 if is_training:
@@ -1540,18 +1561,36 @@ class XLNetModelBuilder(object):
                     opt_loss = self._compute_loss(opt_label, opt_label_mask, opt_result, opt_result_mask)                            # [b]
                     loss += tf.reduce_mean(opt_loss)
                     tf.logging.info("  Batch size = %f", loss)
-            
-            logits = {}
-            if FLAGS.teacher:
-                logits["start_logits"] = start_result
-                top_end_result, _ = tf.nn.top_k(end_result, k=1)
-                logits["end_logits"] = tf.squeeze(top_end_result)
-                logits["unk_logits"] = unk_result
-                logits["yes_logits"] = yes_result
-                logits["no_logits"] = no_result
-                logits["num_logits"] = num_result
-                logits["opt_logits"] = opt_result
                 
+                    if FLAGS.student:
+                        student_start_label = logits["start_logits"]
+                        kd_start_loss = teacher_start_label * tf.math.log(student_start_label)
+                        student_end_label = logits["end_logits"]
+                        kd_end_loss = teacher_end_label * tf.math.log(student_end_label)
+                        kd_loss = tf.reduce_mean(kd_start_loss + kd_end_loss)
+                        
+                        student_unk_label = logits["unk_logits"]
+                        kd_unk_loss = teacher_unk_label * tf.math.log(student_unk_label)
+                        kd_loss += tf.reduce_mean(kd_unk_loss)
+                        
+                        student_yes_label = logits["yes_logits"]
+                        kd_yes_loss = teacher_yes_label * tf.math.log(student_yes_label)
+                        kd_loss += tf.reduce_mean(kd_yes_loss)
+                        
+                        student_no_label = logits["no_logits"]
+                        kd_no_loss = teacher_no_label * tf.math.log(student_no_label)
+                        kd_loss += tf.reduce_mean(kd_no_loss)
+                        
+                        student_num_label = logits["num_logits"]
+                        kd_num_loss = teacher_num_label * tf.math.log(student_num_label)
+                        kd_loss += tf.reduce_mean(kd_num_loss)
+                        
+                        student_opt_label = logits["opt_logits"]
+                        kd_opt_loss = teacher_opt_label * tf.math.log(student_opt_label)
+                        kd_loss += tf.reduce_mean(kd_opt_loss)
+                        
+                        loss += FLAGS.beta4 * kd_loss
+            
         return loss, predicts, logits, model, output_result ### AT를 밖에서 하기 위해 model도 반환
     
     def get_model_fn(self):
@@ -1583,6 +1622,25 @@ class XLNetModelBuilder(object):
                 is_no = features["is_no"]
                 number = features["number"]
                 option = features["option"]
+                
+                if FLAGS.student:
+                    teacher_start_label = features["start_logits"]
+                    teacher_end_label = features["end_logits"]
+                    teacher_unk_label = features["unk_logits"]
+                    teacher_yes_label = features["yes_logits"]
+                    teacher_no_label = features["no_logits"]
+                    teacher_num_label = features["num_logits"]
+                    teacher_opt_label = features["opt_logits"]
+                    
+                else:
+                    teacher_start_label = None
+                    teacher_end_label = None
+                    teacher_unk_label = None
+                    teacher_yes_label = None
+                    teacher_no_label = None
+                    teacher_num_label = None
+                    teacher_opt_label = None
+                    
             else:
                 start_position = None
                 end_position = None
@@ -1591,9 +1649,17 @@ class XLNetModelBuilder(object):
                 is_no = None
                 number = None
                 option = None
+                
+                teacher_start_label = None
+                teacher_end_label = None
+                teacher_unk_label = None
+                teacher_yes_label = None
+                teacher_no_label = None
+                teacher_num_label = None
+                teacher_opt_label = None
             
             loss, predicts, total_logits, model, logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
-                start_position, end_position, is_unk, is_yes, is_no, number, option)
+                start_position, end_position, is_unk, is_yes, is_no, number, option, teacher_start_label, teacher_end_label, teacher_unk_label, teacher_yes_label, teacher_no_label, teacher_num_label, teacher_opt_label)
                                  
             if is_training and FLAGS.adv_training:
                 embed_out = model.get_embedding_output()
@@ -1601,7 +1667,7 @@ class XLNetModelBuilder(object):
                 ## Adversarial training
                 adv_embedding_input = self._adversarial_embedding_input(embed_out, loss)
                 adv_loss, _, _, _ = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
-                    start_position, end_position, is_unk, is_yes, is_no, number, option, AT=True, embedding_input=adv_embedding_input)
+                    start_position, end_position, is_unk, is_yes, is_no, number, option, teacher_start_label, teacher_end_label, teacher_unk_label, teacher_yes_label, teacher_no_label, teacher_num_label, teacher_opt_label, AT=True, embedding_input=adv_embedding_input)
                 loss += FLAGS.beta2 * adv_loss
                 
                 ## Virtual adversarial training
@@ -1610,7 +1676,7 @@ class XLNetModelBuilder(object):
                     d = self._scale_12(d, FLAGS.small_constant_for_finite_diff)
                     perturbed_input = embed_out + d
                     d_logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
-                        start_position, end_position, is_unk, is_yes, is_no, number, option, VAT=True, embedding_input=perturbed_input)
+                        start_position, end_position, is_unk, is_yes, is_no, number, option, teacher_start_label, teacher_end_label, teacher_unk_label, teacher_yes_label, teacher_no_label, teacher_num_label, teacher_opt_label, VAT=True, embedding_input=perturbed_input)
                     kl = self._kl_divergence_with_logits(logits, d_logits)
                     d, = tf.gradients(kl, d, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_ACCUMULATE_N)
                     d = tf.stop_gradient(d)
