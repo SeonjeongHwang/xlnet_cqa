@@ -128,7 +128,9 @@ class InputExample(object):
                  start_position=None,
                  answer_type=None,
                  answer_subtype=None,
-                 is_skipped=False):
+                 is_skipped=False,
+                 rat_start=None,
+                 rat_end=None):
         self.qas_id = qas_id
         self.question_text = question_text
         self.paragraph_text = paragraph_text
@@ -137,6 +139,8 @@ class InputExample(object):
         self.answer_type = answer_type
         self.answer_subtype = answer_subtype
         self.is_skipped = is_skipped
+        self.rat_start = rat_start
+        self.rat_end = rat_end
     
     def __str__(self):
         return self.__repr__()
@@ -151,6 +155,8 @@ class InputExample(object):
             s += ", answer_type: %s" % (prepro_utils.printable_text(self.answer_type))
             s += ", answer_subtype: %s" % (prepro_utils.printable_text(self.answer_subtype))
             s += ", is_skipped: %r" % (self.is_skipped)
+            s += ", rationale_start: %d" % (self.rat_start)
+            s += ", rationale_end: %d" % (self.rat_end)
         return "[{0}]\n".format(s)
 
 class InputFeatures(object):
@@ -417,6 +423,8 @@ class CoqaPipeline(object):
                          paragraph_text):
         input_text = answer["input_text"].strip().lower()
         span_start, span_end = answer["span_start"], answer["span_end"]
+        rat_start = answer["span_start"]
+        rat_end = answer["span_end"]
         if span_start == -1 or span_end == -1:
             span_text = ""
         else:
@@ -434,7 +442,7 @@ class CoqaPipeline(object):
             answer_text = paragraph_text[span_start:span_end+1]
             is_skipped = False
         
-        return answer_text, span_start, span_end, is_skipped
+        return answer_text, span_start, span_end, is_skipped, rat_start, rat_end
     
     def _normalize_answer(self,
                           answer):
@@ -510,7 +518,7 @@ class CoqaPipeline(object):
                 qas_id = "{0}_{1}".format(data_id, i+1)
                 
                 answer_type, answer_subtype = self._get_answer_type(question, answer)
-                answer_text, span_start, span_end, is_skipped = self._get_answer_span(answer, answer_type, paragraph_text)
+                answer_text, span_start, span_end, is_skipped, rat_start, rat_end = self._get_answer_span(answer, answer_type, paragraph_text)
                 question_text = self._get_question_text(question_history, question)
                 question_history = self._get_question_history(question_history, question, answer, answer_type, is_skipped, self.num_turn)
                 
@@ -529,7 +537,9 @@ class CoqaPipeline(object):
                     start_position=start_position,
                     answer_type=answer_type,
                     answer_subtype=answer_subtype,
-                    is_skipped=is_skipped)
+                    is_skipped=is_skipped,
+                    rat_start=rat_start,
+                    rat_end=rat_end)
 
                 examples.append(example)
         
@@ -846,8 +856,23 @@ class XLNetExampleProcessor(object):
             tokenized_start_token_pos = char2token_index[tokenized_start_char_pos]
             tokenized_end_token_pos = char2token_index[tokenized_end_char_pos]
             assert tokenized_start_token_pos <= tokenized_end_token_pos
+
         else:
             tokenized_start_token_pos = tokenized_end_token_pos = -1
+        
+        ### for rationale tagging task
+        if example.rat_start == -1 and example.rat_end == -1:
+            tokenized_rat_start_token_pos = -1
+            tokenized_rat_end_token_pos = -1
+        else:    
+            raw_rat_start_char_pos = example.rat_start
+            raw_rat_end_char_pos = example.rat_end-1
+
+            tokenized_rat_start_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_rat_start_char_pos, is_start=True)
+            tokenized_rat_end_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_rat_end_char_pos, is_start=False)
+            tokenized_rat_start_token_pos = char2token_index[tokenized_rat_start_char_pos]
+            tokenized_rat_end_token_pos = char2token_index[tokenized_rat_end_char_pos]
+            assert tokenized_rat_start_token_pos <= tokenized_rat_end_token_pos
         
         # The -3 accounts for [CLS], [SEP] and [SEP]
         max_para_length = self.max_seq_length - len(query_tokens) - 3
@@ -969,7 +994,33 @@ class XLNetExampleProcessor(object):
                 start_position = cls_index
                 end_position = cls_index
                 
-            for idx in range(start_position, end_position+1):
+            ### for rationale tagging task
+            doc_start = doc_span["start"]
+            doc_end = doc_start + doc_span["length"] - 1
+            
+            rat_start_position = None
+            rat_end_position = None
+            if tokenized_rat_start_token_pos < doc_start and tokenized_rat_end_token_pos < doc_start:
+                rat_start_position = cls_index
+                rat_end_position = cls_index
+            elif tokenized_rat_start_token_pos > doc_end and tokenized_rat_end_token_pos > doc_end:
+                rat_start_position = cls_index
+                rat_end_position = cls_index
+            elif tokenized_rat_start_token_pos < doc_start and tokenized_rat_end_token_pos > doc_end:
+                rat_start_position = 0
+                rat_end_position = doc_end - doc_start
+            elif tokenized_rat_start_token_pos < doc_start and tokenized_rat_end_token_pos <= doc_end:
+                rat_start_position = 0
+                rat_end_position = tokenized_rat_end_token_pos - doc_start
+            elif tokenized_rat_start_token_pos >= doc_start and tokenized_rat_end_token_pos > doc_end:
+                rat_start_position = tokenized_rat_start_token_pos - doc_start
+                rat_end_position = doc_end - doc_start
+            else:
+                rat_start_position = tokenized_rat_start_token_pos - doc_start
+                rat_end_position = tokenized_rat_end_token_pos - doc_end
+                
+                
+            for idx in range(rat_start_position, rat_end_position+1):
                 rationale[idx] = 1
             
             if logging:
