@@ -1,5 +1,7 @@
 import argparse
 import json
+import os
+import collections
 
 import tensorflow as tf
 import numpy as np
@@ -29,12 +31,17 @@ def get_teacher_labels(teacher_files, seq_len):
     total_features = dict()
     for file in teacher_files:
         record_iterator = tf.python_io.tf_record_iterator(path=file)
+        flag = True
         for record in record_iterator:
             example = tf.train.Example()
             example.ParseFromString(record)
             feature = dict(example.features.feature)
             
-            unique_id = np.array(feature["unique_id"].int64_list.value[0])
+            if flag:
+                print(feature)
+                flag = False
+            
+            unique_id = int(np.array(feature["unique_id"].int64_list.value[0]))
             unk_logits = np.array(feature["unk_logits"].float_list.value[:])
             yes_logits = np.array(feature["yes_logits"].float_list.value[:])
             no_logits = np.array(feature["no_logits"].float_list.value[:])
@@ -61,7 +68,7 @@ def get_teacher_labels(teacher_files, seq_len):
                     "start_logits": start_logits,
                     "end_logits": end_logits
                 }
-                total_feature[unique_id] = logits
+                total_features[unique_id] = logits
     
     total_teacher_num = len(teacher_seeds)
     for unique_id in total_features.keys():
@@ -73,16 +80,23 @@ def get_teacher_labels(teacher_files, seq_len):
         total_features[unique_id]["start_logits"] /= total_teacher_num
         total_features[unique_id]["end_logits"] /= total_teacher_num
         
+    print("teacher's features: {0}".format(len(total_features)))
+        
     return total_features
     
 def load_student_features(student_file_dir):
     student_features = dict()
     
     record_iterator = tf.python_io.tf_record_iterator(path=student_file_dir)
+    flag = True
     for record in record_iterator:
         example = tf.train.Example()
         example.ParseFromString(record)
         feature = dict(example.features.feature)
+        
+        if flag:
+            print(feature)
+            flag = False
         
         unique_id = feature["unique_id"].int64_list.value[0]
         input_ids = feature["input_ids"].int64_list.value[:]
@@ -100,21 +114,22 @@ def load_student_features(student_file_dir):
         option = feature["option"].float_list.value[0]
         
         student_features[unique_id] = {
-            "input_ids": input_ids
-            "input_mask": input_mask
-            "p_mask": p_mask
-            "segment_ids": segment_ids
-            "rationale": rationale
-            "cls_index": cls_index
-            "start_position": start_position
-            "end_position": end_position
-            "is_unk": is_unk
-            "is_yes": is_yes
-            "is_no": is_no
-            "number": number
+            "input_ids": input_ids,
+            "input_mask": input_mask,
+            "p_mask": p_mask,
+            "segment_ids": segment_ids,
+            "rationale": rationale,
+            "cls_index": cls_index,
+            "start_position": start_position,
+            "end_position": end_position,
+            "is_unk": is_unk,
+            "is_yes": is_yes,
+            "is_no": is_no,
+            "number": number,
             "option": option
         }
         
+    print("student's features: {0}".format(len(student_features)))
     return student_features
 
 def combine_and_write_tfrecord(logits, features, output_file):
@@ -130,7 +145,7 @@ def combine_and_write_tfrecord(logits, features, output_file):
     with tf.python_io.TFRecordWriter(output_file) as writer:
         for unique_id in unique_ids:
             student_features = collections.OrderedDict()
-            student_features["unique_id"] = create_int_feature([unique_id])
+            student_features["unique_id"] = create_int_feature(np.array([unique_id]))
             student_features["input_ids"] = create_int_feature(features[unique_id]["input_ids"])
             student_features["input_mask"] = create_float_feature(features[unique_id]["input_mask"])
             student_features["p_mask"] = create_float_feature(features[unique_id]["p_mask"])
@@ -154,7 +169,7 @@ def combine_and_write_tfrecord(logits, features, output_file):
             student_features["start_logits"] = create_float_feature(logits[unique_id]["start_logits"].tolist())
             student_features["end_logits"] = create_float_feature(logits[unique_id]["end_logits"].tolist())
     
-            tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+            tf_example = tf.train.Example(features=tf.train.Features(feature=student_features))
             writer.write(tf_example.SerializeToString())
             
 
@@ -162,13 +177,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_arguments(parser)
     args = parser.parse_args()
-    convert_coqa(args.input_file, args.output_file, args.answer_threshold)
     
     teacher_seeds = args.teacher_seeds.strip().split(",")
     teacher_files = []
     for seed in teacher_seeds:
         f_name = os.path.join(args.teacher_logits_dir, "teacher_logits.{0}_{1}.tfrecord".format(args.tag, seed))
-        assert os.path.exists(f_name)
+        assert os.path.exists(f_name), "{0} does not exist".format(f_name)
         teacher_files.append(f_name)
         
     ### teacher file들 읽어서 logits들 평균내기
@@ -178,5 +192,5 @@ if __name__ == "__main__":
     student_features = load_student_features(args.student_train_file)
     
     ### logits과 student unique_id 기준으로 합치고 저장
-    output_file = os.path.join(args.teacher_logits_dir, "student_{0}_train-coqa.tfrecord".format(args.tag))
+    output_file = os.path.join(args.teacher_logits_dir, "student_{0}.train-coqa.tfrecord".format(args.tag))
     combine_and_write_tfrecord(teacher_labels, student_features, output_file)

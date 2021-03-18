@@ -115,6 +115,7 @@ flags.DEFINE_float("small_constant_for_finite_diff", 1e-1, "Small constant for f
 flags.DEFINE_integer("random_seed", default=100, help="Random seed for weight initialzation.")
 flags.DEFINE_bool("teacher", False, "Teacher model for Knowledge distillation")
 flags.DEFINE_bool("student", False, "Student model for Knowledge distillation")
+flags.DEFINE_string("student_name", default="", help="Student dataset name for Knowledge distillation")
 flags.DEFINE_string("teacher_seed_list", default="", help="The list of teacher's logits for knowledge distillation")
 
 
@@ -128,7 +129,9 @@ class InputExample(object):
                  start_position=None,
                  answer_type=None,
                  answer_subtype=None,
-                 is_skipped=False):
+                 is_skipped=False,
+                 orig_rationale_text=None,
+                 rat_start=None):
         self.qas_id = qas_id
         self.question_text = question_text
         self.paragraph_text = paragraph_text
@@ -137,7 +140,9 @@ class InputExample(object):
         self.answer_type = answer_type
         self.answer_subtype = answer_subtype
         self.is_skipped = is_skipped
-    
+        self.orig_rationale_text = orig_rationale_text
+        self.rat_start = rat_start
+        
     def __str__(self):
         return self.__repr__()
     
@@ -151,6 +156,8 @@ class InputExample(object):
             s += ", answer_type: %s" % (prepro_utils.printable_text(self.answer_type))
             s += ", answer_subtype: %s" % (prepro_utils.printable_text(self.answer_subtype))
             s += ", is_skipped: %r" % (self.is_skipped)
+            s += ", rationale_start: %d" % (self.rat_start)
+            s += ", rationale_end: %d" % (self.rat_end)
         return "[{0}]\n".format(s)
 
 class InputFeatures(object):
@@ -433,8 +440,19 @@ class CoqaPipeline(object):
         else:
             answer_text = paragraph_text[span_start:span_end+1]
             is_skipped = False
+            
+        span_text = answer["span_text"]
+        rat_start = answer["span_start"]
+        if span_text == "unknown":
+            rat_text = ""
+        else:
+            rat_text = span_text.lstrip()
+            l_white_len = len(span_text)-len(rat_text)
+            if l_white_len > 0:
+                rat_start += l_white_len
+            rat_text = rat_text.rstrip()
         
-        return answer_text, span_start, span_end, is_skipped
+        return answer_text, span_start, span_end, is_skipped, rat_text, rat_start
     
     def _normalize_answer(self,
                           answer):
@@ -510,7 +528,7 @@ class CoqaPipeline(object):
                 qas_id = "{0}_{1}".format(data_id, i+1)
                 
                 answer_type, answer_subtype = self._get_answer_type(question, answer)
-                answer_text, span_start, span_end, is_skipped = self._get_answer_span(answer, answer_type, paragraph_text)
+                answer_text, span_start, span_end, is_skipped, rat_text, rat_start = self._get_answer_span(answer, answer_type, paragraph_text)
                 question_text = self._get_question_text(question_history, question)
                 question_history = self._get_question_history(question_history, question, answer, answer_type, is_skipped, self.num_turn)
                 
@@ -529,7 +547,9 @@ class CoqaPipeline(object):
                     start_position=start_position,
                     answer_type=answer_type,
                     answer_subtype=answer_subtype,
-                    is_skipped=is_skipped)
+                    is_skipped=is_skipped,
+                    orig_rationale_text=rat_text,
+                    rat_start=rat_start)
 
                 examples.append(example)
         
@@ -846,8 +866,23 @@ class XLNetExampleProcessor(object):
             tokenized_start_token_pos = char2token_index[tokenized_start_char_pos]
             tokenized_end_token_pos = char2token_index[tokenized_end_char_pos]
             assert tokenized_start_token_pos <= tokenized_end_token_pos
+
         else:
             tokenized_start_token_pos = tokenized_end_token_pos = -1
+        
+        ### for rationale tagging task
+        if example.orig_rationale_text == "":
+            tokenized_rat_start_token_pos = -1
+            tokenized_rat_end_token_pos = -1
+        else:    
+            raw_rat_start_char_pos = example.rat_start
+            raw_rat_end_char_pos = raw_rat_start_char_pos + len(example.orig_rationale_text) - 1
+            tokenized_rat_start_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_rat_start_char_pos, is_start=True)
+            tokenized_rat_end_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_rat_end_char_pos, is_start=False)
+            tokenized_rat_start_token_pos = char2token_index[tokenized_rat_start_char_pos]
+            tokenized_rat_end_token_pos = char2token_index[tokenized_rat_end_char_pos]
+            
+            assert tokenized_rat_start_token_pos <= tokenized_rat_end_token_pos, "start:{0}, end:{1}, start_char:{2}, end_char:{3}".format(tokenized_rat_start_token_pos, tokenized_rat_end_token_pos, raw_rat_start_char_pos, raw_rat_end_char_pos)
         
         # The -3 accounts for [CLS], [SEP] and [SEP]
         max_para_length = self.max_seq_length - len(query_tokens) - 3
@@ -969,7 +1004,34 @@ class XLNetExampleProcessor(object):
                 start_position = cls_index
                 end_position = cls_index
                 
-            for idx in range(start_position, end_position+1):
+            ### for rationale tagging task
+            doc_start = doc_span["start"]
+            doc_end = doc_start + doc_span["length"] - 1
+            
+            rat_start_position = None
+            rat_end_position = None
+            if tokenized_rat_start_token_pos < doc_start and tokenized_rat_end_token_pos < doc_start:
+                rat_start_position = cls_index
+                rat_end_position = cls_index
+            elif tokenized_rat_start_token_pos > doc_end and tokenized_rat_end_token_pos > doc_end:
+                rat_start_position = cls_index
+                rat_end_position = cls_index
+            elif tokenized_rat_start_token_pos < doc_start and tokenized_rat_end_token_pos > doc_end:
+                rat_start_position = 0
+                rat_end_position = doc_end - doc_start
+            elif tokenized_rat_start_token_pos < doc_start and tokenized_rat_end_token_pos <= doc_end:
+                rat_start_position = 0
+                rat_end_position = tokenized_rat_end_token_pos - doc_start
+            elif tokenized_rat_start_token_pos >= doc_start and tokenized_rat_end_token_pos > doc_end:
+                rat_start_position = tokenized_rat_start_token_pos - doc_start
+                rat_end_position = doc_end - doc_start
+            else:
+                rat_start_position = tokenized_rat_start_token_pos - doc_start
+                rat_end_position = tokenized_rat_end_token_pos - doc_start
+                
+            assert rat_start_position<=rat_end_position
+                
+            for idx in range(rat_start_position, rat_end_position+1):
                 rationale[idx] = 1
             
             if logging:
@@ -1082,14 +1144,18 @@ class XLNetExampleProcessor(object):
         
         def create_float_feature(values):
             return tf.train.Feature(float_list=tf.train.FloatList(value=list(values)))
-        
+
         with tf.python_io.TFRecordWriter(output_file) as writer:
-            for result in results:
+            tf.logging.info("***** Write teacher's logits *****")
+            tf.logging.info("features: {0}".format(len(results)))
+            for rid, result in enumerate(results):
+                if rid%1000 == 0:
+                    tf.logging.info("{0}/{1}".format(rid, len(results)))
                 logits = collections.OrderedDict()
                 logits["unique_id"] = create_int_feature([result.unique_id])
-                logits["unk_logits"] = create_float_feature(result.unk_logits)
-                logits["yes_logits"] = create_float_feature(result.yes_logits)
-                logits["no_logits"] = create_float_feature(result.no_logits)
+                logits["unk_logits"] = create_float_feature([result.unk_logits])
+                logits["yes_logits"] = create_float_feature([result.yes_logits])
+                logits["no_logits"] = create_float_feature([result.no_logits])
                 logits["num_logits"] = create_float_feature(result.num_logits)
                 logits["opt_logits"] = create_float_feature(result.opt_logits)
                 logits["start_logits"] = create_float_feature(result.start_logits)
@@ -1145,13 +1211,13 @@ class XLNetInputBuilder(object):
             name_to_features["option"] = tf.FixedLenFeature([], tf.float32)
             
             if FLAGS.student:
-                name_to_features["start_position"] = tf.FixedLenFeature([], tf.int64)
-                name_to_features["end_position"] = tf.FixedLenFeature([], tf.int64)
-                name_to_features["is_unk"] = tf.FixedLenFeature([], tf.float32)
-                name_to_features["is_yes"] = tf.FixedLenFeature([], tf.float32)
-                name_to_features["is_no"] = tf.FixedLenFeature([], tf.float32)
-                name_to_features["number"] = tf.FixedLenFeature([], tf.float32)
-                name_to_features["option"] = tf.FixedLenFeature([], tf.float32)            
+                name_to_features["unk_logits"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["yes_logits"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["no_logits"] = tf.FixedLenFeature([], tf.float32)
+                name_to_features["num_logits"] = tf.FixedLenFeature([12], tf.float32)
+                name_to_features["opt_logits"] = tf.FixedLenFeature([3], tf.float32)
+                name_to_features["start_logits"] = tf.FixedLenFeature([seq_length], tf.float32)
+                name_to_features["end_logits"] = tf.FixedLenFeature([seq_length], tf.float32)              
         
         def _decode_record(record,
                            name_to_features):
@@ -1247,6 +1313,14 @@ class XLNetModelBuilder(object):
         else:
             loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=masked_label, logits=masked_predict)
         
+        return loss
+    
+    def _compute_cross_entropy(self,
+                               label,
+                               predict,
+                               predict_mask):    
+        predict = predict + predict_mask
+        loss = label * tf.math.log(predict)
         return loss
     
     def _scale_12(self, x, norm_length):
@@ -1509,19 +1583,19 @@ class XLNetModelBuilder(object):
             logits = {}
             if FLAGS.teacher or FLAGS.student:
                 logits["start_logits"] = start_prob
-                logits["unk_logits"] = tf.nn.softmax(unk_result, axis=-1)
-                logits["yes_logits"] = tf.nn.softmax(yes_result, axis=-1)
-                logits["no_logits"] = tf.nn.softmax(no_result, axis=-1)
+                logits["unk_logits"] = unk_prob
+                logits["yes_logits"] = yes_prob
+                logits["no_logits"] = no_prob
                 logits["num_logits"] = num_probs
                 logits["opt_logits"] = opt_probs
                 if is_training:
                     logits["end_logits"] = end_prob
                 else:
-                    top_end_result, _ = tf.nn.top_k(end_prob, k=1)
-                    logits["end_logits"] = tf.squeeze(top_end_result)
+                    logits["end_logits"] = end_prob[:,0,:]
             
             with tf.variable_scope("loss", reuse=tf.AUTO_REUSE):
                 loss = tf.constant(0.0, dtype=tf.float32)
+                kd_loss = tf.constant(0.0, dtype=tf.float32)
                 if is_training:
                     start_label = start_positions                                                                                    # [b]
                     start_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                  # [b,l] --> [b]
@@ -1560,13 +1634,12 @@ class XLNetModelBuilder(object):
                     opt_label_mask = tf.reduce_max(1 - p_mask, axis=-1)                                                    # [b,l] --> [b]
                     opt_loss = self._compute_loss(opt_label, opt_label_mask, opt_result, opt_result_mask)                            # [b]
                     loss += tf.reduce_mean(opt_loss)
-                    tf.logging.info("  Batch size = %f", loss)
                 
                     if FLAGS.student:
                         student_start_label = logits["start_logits"]
-                        kd_start_loss = teacher_start_label * tf.math.log(student_start_label)
+                        kd_start_loss = self._compute_cross_entropy(teacher_start_label, student_start_label, p_mask)
                         student_end_label = logits["end_logits"]
-                        kd_end_loss = teacher_end_label * tf.math.log(student_end_label)
+                        kd_end_loss = self._compute_cross_entropy(teacher_end_label, student_end_label, p_mask)
                         kd_loss = tf.reduce_mean(kd_start_loss + kd_end_loss)
                         
                         student_unk_label = logits["unk_logits"]
@@ -1588,10 +1661,8 @@ class XLNetModelBuilder(object):
                         student_opt_label = logits["opt_logits"]
                         kd_opt_loss = teacher_opt_label * tf.math.log(student_opt_label)
                         kd_loss += tf.reduce_mean(kd_opt_loss)
-                        
-                        loss += FLAGS.beta4 * kd_loss
             
-        return loss, predicts, logits, model, output_result ### AT를 밖에서 하기 위해 model도 반환
+        return loss, kd_loss, predicts, logits, model, output_result ### AT를 밖에서 하기 위해 model도 반환
     
     def get_model_fn(self):
         """Returns `model_fn` closure for TPUEstimator."""
@@ -1658,7 +1729,7 @@ class XLNetModelBuilder(object):
                 teacher_num_label = None
                 teacher_opt_label = None
             
-            loss, predicts, total_logits, model, logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+            loss, kd_loss, predicts, total_logits, model, logits = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
                 start_position, end_position, is_unk, is_yes, is_no, number, option, teacher_start_label, teacher_end_label, teacher_unk_label, teacher_yes_label, teacher_no_label, teacher_num_label, teacher_opt_label)
                                  
             if is_training and FLAGS.adv_training:
@@ -1666,7 +1737,7 @@ class XLNetModelBuilder(object):
                 
                 ## Adversarial training
                 adv_embedding_input = self._adversarial_embedding_input(embed_out, loss)
-                adv_loss, _, _, _ = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
+                adv_loss, _, _, _, _, _ = self._create_model(is_training, input_ids, input_mask, p_mask, segment_ids, rationale, cls_index,
                     start_position, end_position, is_unk, is_yes, is_no, number, option, teacher_start_label, teacher_end_label, teacher_unk_label, teacher_yes_label, teacher_no_label, teacher_num_label, teacher_opt_label, AT=True, embedding_input=adv_embedding_input)
                 loss += FLAGS.beta2 * adv_loss
                 
@@ -1687,6 +1758,9 @@ class XLNetModelBuilder(object):
                     start_position, end_position, is_unk, is_yes, is_no, number, option, VAT=True, embedding_input=perturbed_input)
                 vadv_loss = self._kl_divergence_with_logits(logits, vadv_logits)
                 loss += FLAGS.beta3 * vadv_loss
+
+            if is_training and FLAGS.student:
+                loss += FLAGS.beta4 * kd_loss   
                 
             scaffold_fn = model_utils.init_from_checkpoint(FLAGS)
             
@@ -1937,13 +2011,6 @@ class XLNetPredictProcessor(object):
         
         self._write_to_json(predict_summary_list, self.output_summary)
         self._write_to_json(predict_detail_list, self.output_detail)
-
-def write_logits(output_dir, tag, seed, logits):
-    tf.logging.info("***** Write teacher's logits *****")
-    f_name = os.path.join(output_dir, "teacher_logits.{0}_{1}.json".format(tag, seed))
-    tf.logging.info("***** {} *****".format(f_name))
-    with open(f_name, "w") as file:
-        json.dump(logits, file, indent=4)
         
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
@@ -1996,21 +2063,26 @@ def main(_):
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
         tf.logging.info("  Num steps = %d", FLAGS.train_steps)
         
-        train_record_file = os.path.join(FLAGS.output_dir, "train-{0}.tfrecord".format(task_name))
-        if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
-            FLAGS.use_rationale = True
-            train_features = example_processor.convert_examples_to_features(train_examples)
-            np.random.shuffle(train_features)
-            example_processor.save_features_as_tfrecord(train_features, train_record_file)
+        if FLAGS.student:
+            train_record_file = os.path.join(FLAGS.output_dir, "{0}.train-{1}.tfrecord".format(FLAGS.student_name, task_name))
+            print(">>>>>>>>>>>>>>>>>>>",train_record_file)
+        else:
+            train_record_file = os.path.join(FLAGS.output_dir, "train-{0}.tfrecord".format(task_name))
+            if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
+                train_features = example_processor.convert_examples_to_features(train_examples)
+                np.random.shuffle(train_features)
+                example_processor.save_features_as_tfrecord(train_features, train_record_file)
         
         train_input_fn = XLNetInputBuilder.get_input_fn(train_record_file, FLAGS.max_seq_length, True, True, FLAGS.shuffle_buffer)
         estimator.train(input_fn=train_input_fn, max_steps=FLAGS.train_steps)
-        
+
         if FLAGS.teacher:
             tf.logging.info("***** Prediction for Knowledge Distillation *****")
             tf.logging.info("  Num examples = %d", len(train_examples))
-            tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
-            results = estimator.predict(input_fn=train_input_fn)
+            tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+            
+            teacher_input_fn = XLNetInputBuilder.get_input_fn(train_record_file, FLAGS.max_seq_length, False, False)            
+            results = estimator.predict(input_fn=teacher_input_fn)
             
             teacher_logits = [OutputLogits(
                 unique_id=result["unique_id"],
@@ -2025,7 +2097,7 @@ def main(_):
             
             teacher_logits_record_file = os.path.join(FLAGS.output_dir, "teacher_logits.{0}_{1}.tfrecord".format(FLAGS.predict_tag, FLAGS.random_seed))
             example_processor.save_logits_as_tfrecord(teacher_logits, teacher_logits_record_file)
-            
+
     if FLAGS.do_predict:
         predict_examples = data_pipeline.get_dev_examples()
         
@@ -2042,7 +2114,7 @@ def main(_):
             example_processor.save_features_as_pickle(predict_features, predict_pickle_file)
         else:
             predict_features = example_processor.load_features_from_pickle(predict_pickle_file)
-        
+
         predict_input_fn = XLNetInputBuilder.get_input_fn(predict_record_file, FLAGS.max_seq_length, False, False)
         results = estimator.predict(input_fn=predict_input_fn)
         
@@ -2058,7 +2130,7 @@ def main(_):
             end_prob=result["end_prob"].tolist(),
             end_index=result["end_index"].tolist()
         ) for result in results]
-        
+
         predict_processor = XLNetPredictProcessor(
             output_dir=FLAGS.output_dir,
             n_best_size=FLAGS.n_best_size,
@@ -2069,7 +2141,7 @@ def main(_):
             predict_tag=FLAGS.predict_tag)
         
         predict_processor.process(predict_examples, predict_features, predict_results)
-    
+        
     if FLAGS.do_export:
         tf.logging.info("***** Running exporting *****")
         if not os.path.exists(FLAGS.export_dir):
