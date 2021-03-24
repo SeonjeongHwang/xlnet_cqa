@@ -12,7 +12,6 @@ import json
 import pickle
 import time
 import string
-import re
 
 import tensorflow as tf
 import numpy as np
@@ -57,6 +56,7 @@ flags.DEFINE_bool("init_global_vars", default=False, help="If true, init all glo
 
 flags.DEFINE_bool("lower_case", default=False, help="Enable lower case nor not.")
 flags.DEFINE_integer("num_turn", default=2, help="Number of turns.")
+flags.DEFINE_integer("doc_stride", default=128, help="Doc stride")
 flags.DEFINE_integer("max_seq_length", default=512, help="Max sequence length")
 flags.DEFINE_integer("max_query_length", default=128, help="Max query length")
 flags.DEFINE_integer("train_batch_size", default=48, help="Total batch size for training.")
@@ -98,6 +98,21 @@ flags.DEFINE_integer("iterations", 1000, "number of iterations per TPU training 
 class InputExample(object):
     """A single CoQA example."""
     def __init__(self,
+                 para_text,
+                 examples):
+        self.para_text = para_text
+        self.examples = examples
+        
+    def __str__(self):
+        return self.__repr__()
+    
+    def __repr__(self):
+        s = "paragraph_text: %s" % (prepro_utils.printable_text(self.para_text))
+        return "[{0}]\n".format(s)
+    
+class eachExample(object):
+    """A single CoQA example."""
+    def __init__(self,
                  qas_id,
                  unique_id,
                  question_text,
@@ -112,18 +127,6 @@ class InputExample(object):
         self.answer_span_text = answer_span_text
         self.orig_answer_text = orig_answer_text
         self.label = label
-        
-    def __str__(self):
-        return self.__repr__()
-    
-    def __repr__(self):
-        s = "qas_id: %s" % (prepro_utils.printable_text(self.qas_id))
-        s += ", question_text: %s" % (prepro_utils.printable_text(self.question_text))
-        s += ", rationale_text: [%s]" % (prepro_utils.printable_text(self.rationale_text))
-        s += ", answer_span_text: [%s]" % (prepro_utils.printable_text(self.answer_span_text))
-        s += ", orig_answer_text: [%s]" % (prepro_utils.printable_text(self.orig_answer_text))
-        s += ", label: [%s]" % (prepro_utils.printable_text(self.label))
-        return "[{0}]\n".format(s)
 
 class InputFeatures(object):
     """A single CoQA feature."""
@@ -412,32 +415,14 @@ class CoqaPipeline(object):
         
         return ' '.join(found_answer_tokens)
     
-    def _clean_answer(self, s):
-        """Lower text and remove punctuation, storys and extra whitespace."""
-
-        def remove_articles(text):
-            regex = re.compile(r'\b(a|an|the)\b', re.UNICODE)
-            return re.sub(regex, ' ', text)
-
-        def white_space_fix(text):
-            return ' '.join(text.split())
-
-        def remove_punc(text):
-            exclude = set(string.punctuation)
-            return ''.join(ch for ch in text if ch not in exclude)
-
-        def lower(text):
-            return text.lower()
-
-        return white_space_fix(remove_articles(remove_punc(lower(s)))) 
-    
     def _get_example(self,
                      data_list):
-        examples = []
+        input_examples = []
         unique_id = 0
         for data in data_list:
             data_id = data["id"]
             paragraph_text = data["story"]
+            each_examples = []
             
             questions = sorted(data["questions"], key=lambda x: x["turn_id"])
             answers = sorted(data["answers"], key=lambda x: x["turn_id"])
@@ -461,12 +446,6 @@ class CoqaPipeline(object):
                 
                 if answer_type in ["unknown", "yes", "no"]:
                     answer_span_text = answer_type
-                    if answer_type == "unknown":
-                        orig_answer_text = "unknown"
-                    if answer_type == "yes":
-                        orig_answer_text == "yes"
-                    if answer_type == "no":
-                        orig_answer_text == "no"
                 
                 if answer_type == "number":
                     answer_span_text = answer_subtype
@@ -474,16 +453,12 @@ class CoqaPipeline(object):
                 if answer_type == "option":
                     answer_span_text = answer_subtype
                     
-                print(self._clean_answer(answer_span_text))
-                print(self._clean_answer(orig_answer_text))
-                print("-"*30)
-                    
-                if self._clean_answer(answer_span_text) == self._clean_answer(orig_answer_text):
+                if answer_span_text.lower() == orig_answer_text.lower():
                     label = 1
                 else:
                     label = 0
                     
-                example = InputExample(
+                example = eachExample(
                     qas_id=qas_id,
                     unique_id=unique_id,
                     question_text=question_text,
@@ -492,10 +467,14 @@ class CoqaPipeline(object):
                     orig_answer_text=orig_answer_text,
                     label=label)
 
-                examples.append(example)
+                each_examples.append(example)
                 unique_id += 1
+            input_example = InputExample(
+                para_text=paragraph_text,
+                examples=each_examples)
+            input_examples.append(input_example)
                 
-        return examples
+        return input_examples
 
 class XLNetTokenizer(object):
     """Default text tokenizer for XLNet"""
@@ -544,6 +523,7 @@ class XLNetTokenizer(object):
 class XLNetExampleProcessor(object):
     """Default example processor for XLNet"""
     def __init__(self,
+                 doc_stride,
                  max_seq_length,
                  max_query_length,
                  tokenizer):
@@ -553,123 +533,327 @@ class XLNetExampleProcessor(object):
         for (i, special_vocab) in enumerate(self.special_vocab_list):
             self.special_vocab_map[special_vocab] = i
         
-        self.segment_vocab_list = ["<q>", "<r>", "<a>", "<cls>", "<sep>", "<pad>"]
+        self.segment_vocab_list = ["<q>", "<c>", "<a>", "<cls>", "<sep>", "<pad>"]
         self.segment_vocab_map = {}
         for (i, segment_vocab) in enumerate(self.segment_vocab_list):
             self.segment_vocab_map[segment_vocab] = i
         
+        self.doc_stride = doc_stride
         self.max_seq_length = max_seq_length
         self.max_query_length = max_query_length
         self.tokenizer = tokenizer
         self.unique_id = 1000000000
     
+    def _generate_match_mapping(self,
+                                para_text,
+                                tokenized_para_text,
+                                N,
+                                M,
+                                max_N,
+                                max_M):
+        """Generate match mapping for raw and tokenized paragraph"""
+        def _lcs_match(para_text,
+                       tokenized_para_text,
+                       N,
+                       M,
+                       max_N,
+                       max_M,
+                       max_dist):
+            """longest common sub-sequence
+            
+            f[i, j] = max(f[i - 1, j], f[i, j - 1], f[i - 1, j - 1] + match(i, j))
+            
+            unlike standard LCS, this is specifically optimized for the setting
+            because the mismatch between sentence pieces and original text will be small
+            """
+            f = np.zeros((max_N, max_M), dtype=np.float32)
+            g = {}
+            
+            for i in range(N):
+                for j in range(i - max_dist, i + max_dist):
+                    if j >= M or j < 0:
+                        continue
+                    
+                    if i > 0:
+                        g[(i, j)] = 0
+                        f[i, j] = f[i - 1, j]
+                    
+                    if j > 0 and f[i, j - 1] > f[i, j]:
+                        g[(i, j)] = 1
+                        f[i, j] = f[i, j - 1]
+                    
+                    f_prev = f[i - 1, j - 1] if i > 0 and j > 0 else 0
+                    
+                    raw_char = prepro_utils.preprocess_text(para_text[i], lower=self.tokenizer.lower_case, remove_space=False)
+                    tokenized_char = tokenized_para_text[j]
+                    if (raw_char == tokenized_char and f_prev + 1 > f[i, j]):
+                        g[(i, j)] = 2
+                        f[i, j] = f_prev + 1
+            
+            return f, g
+        
+        max_dist = abs(N - M) + 5
+        for _ in range(2):
+            lcs_matrix, match_mapping = _lcs_match(para_text, tokenized_para_text, N, M, max_N, max_M, max_dist)
+            
+            if lcs_matrix[N - 1, M - 1] > 0.8 * N:
+                break
+            
+            max_dist *= 2
+        
+        mismatch = lcs_matrix[N - 1, M - 1] < 0.8 * N
+        return match_mapping, mismatch
+    
+    def _convert_tokenized_index(self,
+                                 index,
+                                 pos,
+                                 M=None,
+                                 is_start=True):
+        """Convert index for tokenized text"""
+        if index[pos] is not None:
+            return index[pos]
+        
+        N = len(index)
+        rear = pos
+        while rear < N - 1 and index[rear] is None:
+            rear += 1
+        
+        front = pos
+        while front > 0 and index[front] is None:
+            front -= 1
+        
+        assert index[front] is not None or index[rear] is not None
+        
+        if index[front] is None:
+            if index[rear] >= 1:
+                if is_start:
+                    return 0
+                else:
+                    return index[rear] - 1
+            
+            return index[rear]
+        
+        if index[rear] is None:
+            if M is not None and index[front] < M - 1:
+                if is_start:
+                    return index[front] + 1
+                else:
+                    return M - 1
+            
+            return index[front]
+        
+        if is_start:
+            if index[rear] > index[front] + 1:
+                return index[front] + 1
+            else:
+                return index[rear]
+        else:
+            if index[rear] > index[front] + 1:
+                return index[rear] - 1
+            else:
+                return index[front]
     
     def convert_coqa_example(self,
-                             example,
+                             total_example,
                              logging=False):
         """Converts a single `InputExample` into a single `InputFeatures`."""
-                
-        query_tokens = []
-        qa_texts = example.question_text.split('<s>')
-        for qa_text in qa_texts:
-            qa_text = qa_text.strip()
-            if not qa_text:
-                continue
-
-            query_tokens.append('<s>')
-
-            qa_items = qa_text.split('</s>')
-            if len(qa_items) < 1:
-                continue
-
-            q_text = qa_items[0].strip()
-            q_tokens = self.tokenizer.tokenize(q_text)
-            query_tokens.extend(q_tokens)
-
-            if len(qa_items) < 2:
-                continue
-
-            query_tokens.append('</s>')
-
-            a_text = qa_items[1].strip()
-            a_tokens = self.tokenizer.tokenize(a_text)
-            query_tokens.extend(a_tokens)
-
-        if len(query_tokens) > self.max_query_length:
-            query_tokens = query_tokens[-self.max_query_length:]
-
-        # The -3 accounts for [CLS], [SEP] and [SEP]
-        max_para_length = self.max_seq_length - len(query_tokens) - 3
-
-        input_tokens = []
-        segment_ids = []
-        input_tokens.append("<cls>")
-        segment_ids.append(self.segment_vocab_map["<cls>"])
-
-        # We put P before Q because during pretraining, B is always shorter than A
-        for query_token in query_tokens:
-            input_tokens.append(query_token)
-            segment_ids.append(self.segment_vocab_map["<q>"])
-            
         """
-        rationale_text = example.rationale_text
-        rationale_tokens = self.tokenizer.tokenize(rationale_text)
-        rationale_tokens = ["<s>"] + rationale_tokens + ["</s>"]
-        for rationale_token in rationale_tokens:
-            input_tokens.append(rationale_token)
-            segment_ids.append(self.segment_vocab_map["<r>"])
-        """
-
-        input_tokens.append("<sep>")
-        segment_ids.append(self.segment_vocab_map["<sep>"])
-
-        answer_span_text = example.answer_span_text
-        answer_span_tokens = self.tokenizer.tokenize(answer_span_text)  
-        for answer_token in answer_span_tokens:
-            input_tokens.append(answer_token)
-            segment_ids.append(self.segment_vocab_map["<a>"])
-
-        input_tokens.append("<sep>")
-        segment_ids.append(self.segment_vocab_map["<sep>"])
-
-        input_ids = self.tokenizer.tokens_to_ids(input_tokens)
-
-        # The mask has 0 for real tokens and 1 for padding tokens. Only real tokens are attended to.
-        input_mask = [0] * len(input_ids)
-
-        if len(input_ids) > self.max_seq_length:
-            return []
-
-        # Zero-pad up to the sequence length.
-        while len(input_ids) < self.max_seq_length:
-            input_ids.append(self.special_vocab_map["<pad>"])
-            input_mask.append(1)
-            segment_ids.append(self.segment_vocab_map["<pad>"])
-
-        assert len(input_ids) == self.max_seq_length
-        assert len(input_mask) == self.max_seq_length
-        assert len(segment_ids) == self.max_seq_length
-
-        label = example.label
-
-        if logging:
-            tf.logging.info("*** Example ***")
-            tf.logging.info("qas_id: %s" % example.unique_id)
-            tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-            tf.logging.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
-            tf.logging.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-            printable_input_tokens = [prepro_utils.printable_text(input_token) for input_token in input_tokens]
-            tf.logging.info("input_tokens: %s" % input_tokens)
-            tf.logging.info("label: %s" % str(label))
-
-        feature = InputFeatures(
-            qas_id=example.unique_id,
-            input_ids=input_ids,
-            input_mask=input_mask,
-            segment_ids=segment_ids,
-            label=label)
+        para_text = total_example.para_text
+        para_tokens = self.tokenizer.tokenize(para_text)
         
-        return [feature]
+        char2token_index = []
+        token2char_start_index = []
+        token2char_end_index = []
+        char_idx = 0
+        for i, token in enumerate(para_tokens):
+            char_len = len(token)
+            char2token_index.extend([i] * char_len)
+            token2char_start_index.append(char_idx)
+            char_idx += char_len
+            token2char_end_index.append(char_idx - 1)
+        
+        tokenized_para_text = ''.join(para_tokens).replace(prepro_utils.SPIECE_UNDERLINE, ' ')
+        
+        N, M = len(para_text), len(tokenized_para_text)
+        max_N, max_M = 1024, 1024
+        if N > max_N or M > max_M:
+            max_N = max(N, max_N)
+            max_M = max(M, max_M)
+        
+        match_mapping, mismatch = self._generate_match_mapping(para_text, tokenized_para_text, N, M, max_N, max_M)
+        
+        raw2tokenized_char_index = [None] * N
+        tokenized2raw_char_index = [None] * M
+        i, j = N-1, M-1
+        while i >= 0 and j >= 0:
+            if (i, j) not in match_mapping:
+                break
+            
+            if match_mapping[(i, j)] == 2:
+                raw2tokenized_char_index[i] = j
+                tokenized2raw_char_index[j] = i
+                i, j = i - 1, j - 1
+            elif match_mapping[(i, j)] == 1:
+                j = j - 1
+            else:
+                i = i - 1
+        
+        if all(v is None for v in raw2tokenized_char_index) or mismatch:
+            tf.logging.warning("raw and tokenized paragraph mismatch detected for example: %s" % example.qas_id)
+        
+        token2char_raw_start_index = []
+        token2char_raw_end_index = []
+        for idx in range(len(para_tokens)):
+            start_pos = token2char_start_index[idx]
+            end_pos = token2char_end_index[idx]
+            raw_start_pos = self._convert_tokenized_index(tokenized2raw_char_index, start_pos, N, is_start=True)
+            raw_end_pos = self._convert_tokenized_index(tokenized2raw_char_index, end_pos, N, is_start=False)
+            token2char_raw_start_index.append(raw_start_pos)
+            token2char_raw_end_index.append(raw_end_pos)
+        """
+        
+        feature_list = []
+        passed_features = 0
+        for example in total_example.examples:
+            query_tokens = []
+            qa_texts = example.question_text.split('<s>')
+            for qa_text in qa_texts:
+                qa_text = qa_text.strip()
+                if not qa_text:
+                    continue
+
+                query_tokens.append('<s>')
+
+                qa_items = qa_text.split('</s>')
+                if len(qa_items) < 1:
+                    continue
+
+                q_text = qa_items[0].strip()
+                q_tokens = self.tokenizer.tokenize(q_text)
+                query_tokens.extend(q_tokens)
+
+                if len(qa_items) < 2:
+                    continue
+
+                query_tokens.append('</s>')
+
+                a_text = qa_items[1].strip()
+                a_tokens = self.tokenizer.tokenize(a_text)
+                query_tokens.extend(a_tokens)
+
+            if len(query_tokens) > self.max_query_length:
+                query_tokens = query_tokens[-self.max_query_length:]
+
+            # The -3 accounts for [CLS], [SEP] and [SEP]
+            max_para_length = self.max_seq_length - len(query_tokens) - 3
+
+            input_tokens = []
+            segment_ids = []
+            input_tokens.append("<cls>")
+            segment_ids.append(self.segment_vocab_map["<cls>"])
+
+            # We put P before Q because during pretraining, B is always shorter than A
+            for query_token in query_tokens:
+                input_tokens.append(query_token)
+                segment_ids.append(self.segment_vocab_map["<q>"])
+            
+            answer_span_text = example.answer_span_text
+            """
+            answer_start_char = para_text.find(answer_span_text)
+            assert answer_start_char!=-1
+
+            raw_start_char_pos = answer_start_char
+            raw_end_char_pos = raw_start_char_pos + len(example.answer_span_text) - 1
+            tokenized_start_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_start_char_pos, is_start=True)
+            tokenized_end_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_end_char_pos, is_start=False)
+            tokenized_start_token_pos = char2token_index[tokenized_start_char_pos]
+            tokenized_end_token_pos = char2token_index[tokenized_end_char_pos]
+            assert tokenized_start_token_pos <= tokenized_end_token_pos
+
+
+            answer_start_token = tokenized_start_token_pos
+            answer_end_token = tokenized_end_token_pos
+
+            rest_stride = self.doc_stride - (answer_end_token-answer_start_token+1)
+            fore_stride = int(rest_stride/2)
+            rear_stride = int(rest_stride/2)
+            context_tokens = []
+            context_start_token = answer_start_token-fore_stride
+            if context_start_token >= 0:
+                context_tokens.extend(para_tokens[context_start_token:answer_start_token])
+            else:
+                context_tokens.extend(para_tokens[:answer_start_token])
+            context_tokens.extend(para_tokens[answer_start_token:answer_end_token+1])
+            context_end_token = answer_end_token+rear_stride
+            if context_end_token < len(para_tokens):
+                context_tokens.extend(para_tokens[answer_end_token:context_end_token])
+            else:
+                context_tokens.extend(para_tokens[answer_end_token:])
+
+            for context_token in context_tokens:
+                input_tokens.append(context_token)
+                segment_ids.append(self.segment_vocab_map["<c>"])
+
+    
+            rationale_text = example.rationale_text
+            rationale_tokens = self.tokenizer.tokenize(rationale_text)
+            rationale_tokens = ["<s>"] + rationale_tokens + ["</s>"]
+            for rationale_token in rationale_tokens:
+                input_tokens.append(rationale_token)
+                segment_ids.append(self.segment_vocab_map["<r>"])
+
+            """
+            input_tokens.append("<sep>")
+            segment_ids.append(self.segment_vocab_map["<sep>"])
+
+            answer_span_tokens = self.tokenizer.tokenize(answer_span_text)  
+            for answer_token in answer_span_tokens:
+                input_tokens.append(answer_token)
+                segment_ids.append(self.segment_vocab_map["<a>"])
+
+            input_tokens.append("<sep>")
+            segment_ids.append(self.segment_vocab_map["<sep>"])
+
+            input_ids = self.tokenizer.tokens_to_ids(input_tokens)
+
+            # The mask has 0 for real tokens and 1 for padding tokens. Only real tokens are attended to.
+            input_mask = [0] * len(input_ids)
+
+            if len(input_ids) > self.max_seq_length:
+                continue
+
+            # Zero-pad up to the sequence length.
+            while len(input_ids) < self.max_seq_length:
+                input_ids.append(self.special_vocab_map["<pad>"])
+                input_mask.append(1)
+                segment_ids.append(self.segment_vocab_map["<pad>"])
+
+            assert len(input_ids) == self.max_seq_length
+            assert len(input_mask) == self.max_seq_length
+            assert len(segment_ids) == self.max_seq_length
+
+            label = example.label
+
+            if logging:
+                tf.logging.info("*** Example ***")
+                tf.logging.info("qas_id: %s" % example.unique_id)
+                tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+                tf.logging.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+                tf.logging.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+                printable_input_tokens = [prepro_utils.printable_text(input_token) for input_token in input_tokens]
+                tf.logging.info("input_tokens: %s" % input_tokens)
+                tf.logging.info("label: %s" % str(label))
+
+            feature = InputFeatures(
+                qas_id=example.unique_id,
+                input_ids=input_ids,
+                input_mask=input_mask,
+                segment_ids=segment_ids,
+                label=label)
+
+            feature_list.append(feature)
+        
+        return feature_list
     
     def convert_examples_to_features(self,
                                      examples):
@@ -828,7 +1012,7 @@ class XLNetModelBuilder(object):
 
         with tf.variable_scope("nlu", reuse=tf.AUTO_REUSE):
             with tf.variable_scope("classifier", reuse=tf.AUTO_REUSE):
-                result = tf.layers.dense(cls_result, units=self.model_config.d_model, activation=tf.nn.relu,
+                result = tf.layers.dense(cls_result, units=self.model_config.d_model, activation=tf.tanh,
                                          use_bias=True, kernel_initializer=initializer, bias_initializer=tf.zeros_initializer,
                                          kernel_regularizer=None, bias_regularizer=None, trainable=True, name="classification1")
                 result = tf.contrib.layers.layer_norm(result, center=True, scale=True, activation_fn=None,
@@ -930,7 +1114,7 @@ class XLNetPredictProcessor(object):
                 file.write("{0}\n".format(data))
     
     def process(self,
-                examples,
+                total_examples,
                 results):
         predict_summary_list = []
         
@@ -941,40 +1125,42 @@ class XLNetPredictProcessor(object):
         y_true = []
         y_pred = []
             
-        num_example=len(examples)
-        for (example_idx, example) in enumerate(examples):
-            if example_idx % 1000 == 0:
-                tf.logging.info('Updating {0} example with predict'.format(example_idx))
+        num_example = 0
+        for example_list in total_examples:
+            num_example+=len(example_list.examples)
+            for (example_idx, example) in enumerate(example_list.examples):
+                if example_idx % 1000 == 0:
+                    tf.logging.info('Updating {0} example with predict'.format(example_idx))
 
-            if example.unique_id not in qas_id_to_results:
-                tf.logging.warning('No result found for example: {0}'.format(example.unique_id))
-                continue
+                if example.unique_id not in qas_id_to_results:
+                    tf.logging.warning('No result found for example: {0}'.format(example.unique_id))
+                    continue
 
-            qas_id = example.unique_id
-            result = qas_id_to_results[qas_id]
+                qas_id = example.unique_id
+                result = qas_id_to_results[qas_id]
 
-            qas_id = example.qas_id
-            query = example.question_text
-            rationale = example.rationale_text
-            answer = example.answer_span_text
-            gold_answer = example.orig_answer_text
-            probability = float(result.prob)
-            prediction = 1 if probability >= 0.5 else 0
-            label = example.label
+                qas_id = example.qas_id
+                query = example.question_text
+                rationale = example.rationale_text
+                answer = example.answer_span_text
+                gold_answer = example.orig_answer_text
+                probability = float(result.prob)
+                prediction = 1 if probability >= 0.5 else 0
+                label = example.label
 
-            y_true.append(label)
-            y_pred.append(prediction)
+                y_true.append(label)
+                y_pred.append(prediction)
 
-            predict_summary_list.append({
-                "qas_id": example.qas_id,
-                "question_text": query,
-                "rationale": rationale,
-                "extracted_answer": answer,
-                "original_answer": gold_answer,
-                "predicted_label": prediction,
-                "label": label,
-                "probability": probability
-            })
+                predict_summary_list.append({
+                    "qas_id": example.qas_id,
+                    "question_text": query,
+                    "rationale": rationale,
+                    "extracted_answer": answer,
+                    "original_answer": gold_answer,
+                    "predicted_label": prediction,
+                    "label": label,
+                    "probability": probability
+                })
         
         self._write_to_json(predict_summary_list, self.output_summary)
         
@@ -1016,6 +1202,7 @@ def main(_):
         lower_case=FLAGS.lower_case)
     
     example_processor = XLNetExampleProcessor(
+        doc_stride=FLAGS.doc_stride,
         max_seq_length=FLAGS.max_seq_length,
         max_query_length=FLAGS.max_query_length,
         tokenizer=tokenizer)

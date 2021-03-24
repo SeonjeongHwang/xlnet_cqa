@@ -24,7 +24,7 @@ import function_builder
 import prepro_utils
 import model_utils
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 MAX_FLOAT = 1e30
 MIN_FLOAT = -1e30
@@ -117,6 +117,9 @@ flags.DEFINE_bool("teacher", False, "Teacher model for Knowledge distillation")
 flags.DEFINE_bool("student", False, "Student model for Knowledge distillation")
 flags.DEFINE_string("student_name", default="", help="Student dataset name for Knowledge distillation")
 flags.DEFINE_string("teacher_seed_list", default="", help="The list of teacher's logits for knowledge distillation")
+
+##for para_classification data
+flags.DEFINE_bool("para_class", False, "Generate the augmented data for paraphrase classification")
 
 
 class InputExample(object):
@@ -1816,15 +1819,19 @@ class XLNetPredictProcessor(object):
                  end_n_top,
                  max_answer_length,
                  tokenizer,
-                 predict_tag=None):
+                 predict_tag=None,
+                 for_train=False):
         """Construct XLNet predict processor"""
         self.n_best_size = n_best_size
         self.start_n_top = start_n_top
         self.end_n_top = end_n_top
         self.max_answer_length = max_answer_length
         self.tokenizer = tokenizer
+        self.for_train = for_train
         
         predict_tag = predict_tag if predict_tag else str(time.time())
+        if self.for_train:
+            self.output_plausible = os.path.join(output_dir, "plausible.{0}.json".format(predict_tag))
         self.output_summary = os.path.join(output_dir, "predict.{0}.summary.json".format(predict_tag))
         self.output_detail = os.path.join(output_dir, "predict.{0}.detail.json".format(predict_tag))
     
@@ -1866,6 +1873,7 @@ class XLNetPredictProcessor(object):
         for result in results:
             unique_id_to_result[result.unique_id] = result
         
+        plausible_answer_list = []
         predict_summary_list = []
         predict_detail_list = []
         num_example = len(examples)
@@ -1970,6 +1978,13 @@ class XLNetPredictProcessor(object):
                     "predict_text": "",
                     "predict_score": 0.0
                 })
+                
+            if self.for_train:
+                ### paraphrase classification을 위한 data augmentation ###
+                plausible_answer_list.append({
+                    "qas_id": example.qas_id,
+                    "predict_text_list": example_top_predicts
+                })                
             
             example_best_predict = example_top_predicts[0]
             
@@ -2009,6 +2024,9 @@ class XLNetPredictProcessor(object):
                 "top_predicts": example_top_predicts
             })
         
+        if self.for_train:
+            self._write_to_json(plausible_answer_list, self.output_plausible)
+            return
         self._write_to_json(predict_summary_list, self.output_summary)
         self._write_to_json(predict_detail_list, self.output_detail)
         
@@ -2068,10 +2086,15 @@ def main(_):
             print(">>>>>>>>>>>>>>>>>>>",train_record_file)
         else:
             train_record_file = os.path.join(FLAGS.output_dir, "train-{0}.tfrecord".format(task_name))
+            train_pickle_file = os.path.join(FLAGS.output_dir, "train-{0}.pkl".format(task_name))
             if not os.path.exists(train_record_file) or FLAGS.overwrite_data:
                 train_features = example_processor.convert_examples_to_features(train_examples)
                 np.random.shuffle(train_features)
                 example_processor.save_features_as_tfrecord(train_features, train_record_file)
+                example_processor.save_features_as_pickle(train_features, train_pickle_file)
+            else:
+                if FLAGS.para_class:
+                    train_features = example_processor.load_features_from_pickle(train_pickle_file)
         
         train_input_fn = XLNetInputBuilder.get_input_fn(train_record_file, FLAGS.max_seq_length, True, True, FLAGS.shuffle_buffer)
         estimator.train(input_fn=train_input_fn, max_steps=FLAGS.train_steps)
@@ -2097,6 +2120,35 @@ def main(_):
             
             teacher_logits_record_file = os.path.join(FLAGS.output_dir, "teacher_logits.{0}_{1}.tfrecord".format(FLAGS.predict_tag, FLAGS.random_seed))
             example_processor.save_logits_as_tfrecord(teacher_logits, teacher_logits_record_file)
+            
+        if FLAGS.para_class:
+            para_input_fn = XLNetInputBuilder.get_input_fn(train_record_file, FLAGS.max_seq_length, False, False)
+            results = estimator.predict(input_fn=para_input_fn)
+            
+            train_results = [OutputResult(
+                unique_id=result["unique_id"],
+                unk_prob=result["unk_prob"],
+                yes_prob=result["yes_prob"],
+                no_prob=result["no_prob"],
+                num_probs=result["num_probs"].tolist(),
+                opt_probs=result["opt_probs"].tolist(),
+                start_prob=result["start_prob"].tolist(),
+                start_index=result["start_index"].tolist(),
+                end_prob=result["end_prob"].tolist(),
+                end_index=result["end_index"].tolist()
+            ) for result in results]
+            
+            predict_processor = XLNetPredictProcessor(
+                output_dir=FLAGS.output_dir,
+                n_best_size=FLAGS.n_best_size,
+                start_n_top=FLAGS.start_n_top,
+                end_n_top=FLAGS.end_n_top,
+                max_answer_length=FLAGS.max_answer_length,
+                tokenizer=tokenizer,
+                predict_tag=FLAGS.predict_tag,
+                for_train=True)
+            
+            predict_processor.process(train_examples, train_features, train_results)
 
     if FLAGS.do_predict:
         predict_examples = data_pipeline.get_dev_examples()
@@ -2108,7 +2160,6 @@ def main(_):
         predict_record_file = os.path.join(FLAGS.output_dir, "dev-{0}.tfrecord".format(task_name))
         predict_pickle_file = os.path.join(FLAGS.output_dir, "dev-{0}.pkl".format(task_name))
         if not os.path.exists(predict_record_file) or not os.path.exists(predict_pickle_file) or FLAGS.overwrite_data:
-            FLAGS.use_rationale = True
             predict_features = example_processor.convert_examples_to_features(predict_examples)
             example_processor.save_features_as_tfrecord(predict_features, predict_record_file)
             example_processor.save_features_as_pickle(predict_features, predict_pickle_file)
